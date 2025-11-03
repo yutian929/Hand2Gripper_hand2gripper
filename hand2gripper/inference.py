@@ -24,7 +24,7 @@ import cv2
 from typing import Dict
 
 # 假设此脚本与 models 目录在同一级别
-from models.simple import Hand2GripperModel
+from .models.simple import Hand2GripperModel
 
 # ------------------------------
 # 可视化工具函数 (从 phantom.utils.hand2gripper_visualize.py 简化而来)
@@ -73,7 +73,7 @@ class Hand2GripperInference:
         print(f"Model loaded from {checkpoint_path} and set to evaluation mode on {self.device}.")
 
     @torch.no_grad()
-    def predict(self, color: np.ndarray, bbox: np.ndarray, keypoints_3d: np.ndarray,
+    def predict_t(self, color: np.ndarray, bbox: np.ndarray, keypoints_3d: np.ndarray,
                 contact: np.ndarray, is_right: np.ndarray) -> Dict[str, torch.Tensor]:
         """
         对单个样本执行完整的推理流程。
@@ -103,6 +103,53 @@ class Hand2GripperInference:
         outputs = self.model(crop_t, kp3d_t, contact_t, isright_t)
         
         return outputs
+
+    @torch.no_grad()
+    def predict(self, color: np.ndarray, bbox: np.ndarray, keypoints_3d: np.ndarray,
+                contact: np.ndarray, is_right: np.ndarray) -> Dict[str, torch.Tensor]:
+        """
+        对单个样本执行完整的推理流程。
+
+        Args:
+            color (np.ndarray): 原始图像, [H,W,3] 或 [3,H,W], uint8/float
+            bbox (np.ndarray): 边界框, [4]
+            keypoints_3d (np.ndarray): 3D关节点, [21,3]
+            contact (np.ndarray): 接触概率/logits, [21]
+            is_right (np.ndarray): 是否为右手, 标量或 [1]
+
+        Returns:
+            Dict[str, torch.Tensor]: 模型的原始输出字典。
+        """
+        # 1. 使用模型内部的读取函数将 numpy 数组转换为 batched tensor
+        color_t = self.model._read_color(color).to(self.device)
+        bbox_t = self.model._read_bbox(bbox).to(self.device)
+        kp3d_t = self.model._read_keypoints_3d(keypoints_3d).to(self.device)
+        contact_t = self.model._read_contact(contact).to(self.device)
+        isright_t = self.model._read_is_right(is_right).to(self.device)
+
+        # 2. 预处理：裁剪和缩放图像
+        # 注意：这一步是在模型外部完成的，与训练脚本保持一致
+        crop_t = self.model._crop_and_resize(color_t, bbox_t)
+
+        # 3. 模型前向传播
+        outputs = self.model(crop_t, kp3d_t, contact_t, isright_t)
+        
+        return outputs['pred_triple'].squeeze().cpu().numpy()
+    
+    def vis_output(self, image: np.ndarray, kpts_2d: np.ndarray, pred_triple: np.array) -> np.ndarray:
+        """
+        可视化模型输出结果。
+
+        Args:
+            image (np.ndarray): 原始图像, [H,W,3], uint8
+            kpts_2d (np.ndarray): 2D关节点, [21,2]
+            pred_triple (np.ndarray): 预测的抓手关节点索引, [3]
+
+        Returns:
+            np.ndarray: 带有可视化结果的图像。
+        """
+        vis_img = vis_selected_gripper(image, kpts_2d, pred_triple)
+        return vis_img
 
 # ------------------------------
 # 主函数
@@ -147,7 +194,7 @@ def main(args):
     )
 
     # 后处理和打印结果
-    pred_triple = outputs['pred_triple'].squeeze().cpu().numpy()
+    pred_triple = outputs
     print("\n" + "="*30)
     print("      Inference Result")
     print("="*30)
@@ -173,7 +220,7 @@ def main(args):
         vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
 
         # 绘制结果
-        vis_img_result = vis_selected_gripper(vis_img, kpts_2d_np, pred_triple)
+        vis_img_result = inference_engine.vis_output(vis_img, kpts_2d_np, pred_triple)
         
         # 保存图像
         try:
