@@ -170,6 +170,7 @@ class Hand2GripperModel(nn.Module):
     def __init__(self, d_model: int = 256, img_size: int = 256):
         super().__init__()
         self.img_size = img_size
+        self.crop_scale = 1.2
         self.backbone = TinyCNN(out_dim=d_model)
         self.encoder = HandNodeEncoder(in_dim=26, hidden=d_model, n_layers=2, out_dim=d_model)
         self.decoder = TripleDecoder(d_model=d_model)
@@ -310,7 +311,7 @@ class Hand2GripperModel(nn.Module):
 
     def _crop_and_resize(self, color: torch.Tensor, bbox: torch.Tensor) -> torch.Tensor:
         B, C, H, W = color.shape
-        bbox = self._expand_bbox(bbox, H, W, scale=1.2)
+        bbox = self._expand_bbox(bbox, H, W, self.crop_scale)
         crops = []
         for b in range(B):
             x1, y1, x2, y2 = bbox[b]
