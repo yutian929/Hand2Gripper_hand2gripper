@@ -116,7 +116,6 @@ class Hand2GripperDataset(Dataset):
                 if not fn.lower().endswith('.npz'):
                     continue
                 full_path = os.path.join(dirpath, fn)
-                breakpoint()
                 try:
                     if self._check_valid_sample(full_path):
                         all_sample_paths.append(full_path)
@@ -127,6 +126,7 @@ class Hand2GripperDataset(Dataset):
         # sort for determinism
         all_sample_paths.sort()
         print(f"[Hand2GripperDataset] Loaded {len(all_sample_paths)} samples from {root_dir}")
+
         return all_sample_paths
     
     def _check_valid_sample(self, sample_path):
@@ -283,22 +283,7 @@ def eval_metrics(out, gt_base, gt_left, gt_right):
 # ------------------------------
 # 训练主函数
 # ------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", type=str, default="", help="真实数据根目录（含各 sample.npz 文件）")
-    parser.add_argument("--epochs", type=int, default=100, help="训练轮数，None表示自动训练直到收敛")
-    parser.add_argument("--batch_size", type=int, default=64, help="批大小")
-    parser.add_argument("--lr", type=float, default=3e-4, help="学习率")
-    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例（真实数据时生效）")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--save", type=str, default="hand2gripper.pt", help="模型保存路径")
-    parser.add_argument("--patience", type=int, default=15, help="早停耐心值")
-    parser.add_argument("--stability_window", type=int, default=10, help="稳定性检测窗口大小")
-    parser.add_argument("--stability_threshold", type=float, default=0.005, help="稳定性阈值")
-    parser.add_argument("--resume", type=str, default="", help="从预训练模型继续训练（模型文件路径）")
-    parser.add_argument("--resume_optimizer", action="store_true", help="同时加载优化器状态（需要保存的优化器状态文件）")
-    args = parser.parse_args()
+def main(args):
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -323,7 +308,6 @@ def main():
     lw = LossWeights()
     
     # 加载预训练模型
-    start_epoch = 0
     if args.resume:
         if os.path.exists(args.resume):
             print(f"Loading pretrained model from {args.resume}")
@@ -364,29 +348,28 @@ def main():
         model.train()
         meter = {k: 0.0 for k in ["loss", "ce_base", "ce_left", "ce_right", "ce_triple", "contact", "dist_upper"]}
         for step, batch in enumerate(train_loader, 1):
-            color = batch["img_rgb_t"].to(device)
-            bbox = batch["bbox_t"].to(device).float()
-            joints = batch["kpts_3d_t"].to(device)
-            contact_joint_out = batch["contact_logits_t"].to(device)
-            is_right = batch["is_right_t"].to(device)
+            img_rgb_t = batch["img_rgb_t"].to(device)
+            bbox_t = batch["bbox_t"].to(device).float()
+            kpts_3d_t = batch["kpts_3d_t"].to(device)
+            contact_logits_t = batch["contact_logits_t"].to(device)
+            is_right_t = batch["is_right_t"].to(device)
             
-            gt_ids = batch["selected_gripper_blr_ids_t"].to(device)
-            gt_base = gt_ids[:, 0].view(-1)
-            gt_left = gt_ids[:, 1].view(-1)
-            gt_right = gt_ids[:, 2].view(-1)
-
-            # print(keypoints_3d.shape, keypoints_3d[:,0,:])
+            selected_gripper_blr_ids_t = batch["selected_gripper_blr_ids_t"].to(device)
+            gt_base_t = selected_gripper_blr_ids_t[:, 0].view(-1)
+            gt_left_t = selected_gripper_blr_ids_t[:, 1].view(-1)
+            gt_right_t = selected_gripper_blr_ids_t[:, 2].view(-1)
 
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                out = model(color, bbox, joints, contact_joint_out, is_right.view(-1))
+                preprocessed_crop_img_rgb = model._crop_and_resize(img_rgb_t, bbox_t)
+                out = model.forward(preprocessed_crop_img_rgb, kpts_3d_t, contact_logits_t, is_right_t.view(-1))
                 # 关键点规范化（与模型内部一致）用于距离先验
-                kp = joints.clone()
+                kp = kpts_3d_t.clone()
                 wrist = kp[:, 0:1, :]
                 kp = kp - wrist
                 scale = kp.norm(dim=-1).mean(dim=1, keepdim=True).clamp(min=1e-6)
                 kp_norm = kp / scale.unsqueeze(-1)
 
-                loss, loss_items = compute_losses(out, gt_base, gt_left, gt_right, kp_norm, contact_joint_out, lw)
+                loss, loss_items = compute_losses(out, gt_base_t, gt_left_t, gt_right_t, kp_norm, contact_logits_t, lw)
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -404,19 +387,20 @@ def main():
         eval_meter = {"base_acc": 0.0, "left_acc": 0.0, "right_acc": 0.0, "triple_acc": 0.0}
         with torch.no_grad():
             for batch in val_loader:
-                color = batch["img_rgb_t"].to(device)
-                bbox = batch["bbox_t"].to(device).float()
-                joints = batch["kpts_3d_t"].to(device)
-                contact_joint_out = batch["contact_logits_t"].to(device)
-                is_right = batch["is_right_t"].to(device)
+                img_rgb_t = batch["img_rgb_t"].to(device)
+                bbox_t = batch["bbox_t"].to(device).float()
+                kpts_3d_t = batch["kpts_3d_t"].to(device)
+                contact_logits_t = batch["contact_logits_t"].to(device)
+                is_right_t = batch["is_right_t"].to(device)
+                
+                selected_gripper_blr_ids_t = batch["selected_gripper_blr_ids_t"].to(device)
+                gt_base_t = selected_gripper_blr_ids_t[:, 0].view(-1)
+                gt_left_t = selected_gripper_blr_ids_t[:, 1].view(-1)
+                gt_right_t = selected_gripper_blr_ids_t[:, 2].view(-1)
 
-                gt_ids = batch["selected_gripper_blr_ids_t"].to(device)
-                gt_base = gt_ids[:, 0].view(-1)
-                gt_left = gt_ids[:, 1].view(-1)
-                gt_right = gt_ids[:, 2].view(-1)
-
-                out = model(color, bbox, joints, contact_joint_out, is_right.view(-1))
-                m = eval_metrics(out, gt_base, gt_left, gt_right)
+                preprocessed_crop_img_rgb = model._crop_and_resize(img_rgb_t, bbox_t)
+                out = model.forward(preprocessed_crop_img_rgb, kpts_3d_t, contact_logits_t, is_right_t.view(-1))
+                m = eval_metrics(out, gt_base_t, gt_left_t, gt_right_t)
                 for k in eval_meter:
                     eval_meter[k] += m[k]
 
@@ -456,4 +440,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_root", type=str, default="", help="真实数据根目录（含各 sample.npz 文件）")
+    parser.add_argument("--epochs", type=int, default=100, help="训练轮数，None表示自动训练直到收敛")
+    parser.add_argument("--batch_size", type=int, default=64, help="批大小")
+    parser.add_argument("--lr", type=float, default=3e-4, help="学习率")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例（真实数据时生效）")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--save", type=str, default="hand2gripper.pt", help="模型保存路径")
+    parser.add_argument("--patience", type=int, default=15, help="早停耐心值")
+    parser.add_argument("--stability_window", type=int, default=10, help="稳定性检测窗口大小")
+    parser.add_argument("--stability_threshold", type=float, default=0.005, help="稳定性阈值")
+    parser.add_argument("--resume", type=str, default="", help="从预训练模型继续训练（模型文件路径）")
+    parser.add_argument("--resume_optimizer", action="store_true", help="同时加载优化器状态（需要保存的优化器状态文件）")
+    args = parser.parse_args()
+    main(args)
