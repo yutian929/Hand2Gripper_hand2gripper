@@ -24,7 +24,7 @@ import cv2
 from typing import Dict
 
 # 假设此脚本与 models 目录在同一级别
-from .models.simple import Hand2GripperModel
+from models.simple import Hand2GripperModel
 
 # ------------------------------
 # 可视化工具函数 (从 phantom.utils.hand2gripper_visualize.py 简化而来)

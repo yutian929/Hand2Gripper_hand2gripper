@@ -26,6 +26,11 @@ Hand-to-Gripper (2-finger) Mapping Model (Ordered Base/Left/Right)
 2. 用掌根(0)和四指根部(5,9,13,17)拟合平面，计算掌心法向量
 3. 将法向量旋转到x轴正方向（掌心朝x正向）
 4. 全局尺度归一化（所有点到原点距离的均值为1）
+
+模型架构改进:
+- 使用DINOv2预训练骨干提取图像特征（保留空间维度）
+- 使用Cross-Attention让关节点查询图像特征（替代FiLM）
+- 使用图注意力网络建模手指骨骼连接结构
 """
 
 import os
@@ -33,11 +38,151 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 
 # ------------------------------
-# 小型视觉骨干
+# 手部骨骼图结构定义
+# ------------------------------
+# 21个关键点的连接关系（骨骼边）
+# 0: Wrist
+# 1-4: Thumb (CMC, MCP, IP, TIP)
+# 5-8: Index (MCP, PIP, DIP, TIP)
+# 9-12: Middle (MCP, PIP, DIP, TIP)
+# 13-16: Ring (MCP, PIP, DIP, TIP)
+# 17-20: Pinky (MCP, PIP, DIP, TIP)
+
+HAND_EDGES = [
+    # 拇指
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    # 食指
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    # 中指
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    # 无名指
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    # 小指
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    # 掌心横向连接（可选，增强掌心结构）
+    (5, 9), (9, 13), (13, 17),
+]
+
+
+def build_hand_adjacency_matrix(num_joints: int = 21, edges: list = HAND_EDGES, 
+                                  self_loop: bool = True) -> torch.Tensor:
+    """构建手部骨骼的邻接矩阵"""
+    adj = torch.zeros(num_joints, num_joints)
+    for i, j in edges:
+        adj[i, j] = 1.0
+        adj[j, i] = 1.0  # 无向图
+    if self_loop:
+        adj = adj + torch.eye(num_joints)
+    # 归一化（对称归一化）
+    deg = adj.sum(dim=1, keepdim=True).clamp(min=1.0)
+    adj = adj / deg.sqrt() / deg.sqrt().T
+    return adj
+
+
+# ------------------------------
+# DINOv2 视觉骨干
+# ------------------------------
+class DINOv2Backbone(nn.Module):
+    """
+    使用预训练DINOv2提取图像特征
+    输出: 保留空间维度的feature map [B, H', W', D] 和 全局特征 [B, D]
+    """
+    def __init__(self, model_name: str = "dinov2_vits14", out_dim: int = 256, 
+                 freeze_backbone: bool = True):
+        super().__init__()
+        self.freeze_backbone = freeze_backbone
+        
+        # 加载DINOv2模型
+        try:
+            self.dino = torch.hub.load('facebookresearch/dinov2', model_name)
+            print(f"Loaded DINOv2 model: {model_name}")
+        except Exception as e:
+            print(f"Warning: Failed to load DINOv2 from hub: {e}")
+            print("Falling back to TinyCNN backbone")
+            self.dino = None
+            self.fallback = TinyCNN(out_dim=out_dim)
+            self.use_fallback = True
+            return
+        
+        self.use_fallback = False
+        
+        # DINOv2特征维度
+        if 'vits' in model_name:
+            dino_dim = 384
+        elif 'vitb' in model_name:
+            dino_dim = 768
+        elif 'vitl' in model_name:
+            dino_dim = 1024
+        elif 'vitg' in model_name:
+            dino_dim = 1536
+        else:
+            dino_dim = 384  # default
+        
+        self.dino_dim = dino_dim
+        self.out_dim = out_dim
+        
+        # 投影层
+        self.proj = nn.Linear(dino_dim, out_dim)
+        self.proj_spatial = nn.Conv2d(dino_dim, out_dim, 1)
+        
+        # 冻结DINOv2参数
+        if freeze_backbone and self.dino is not None:
+            for param in self.dino.parameters():
+                param.requires_grad = False
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, 3, H, W] 输入图像
+        Returns:
+            feat_map: [B, H', W', D] 空间特征图
+            feat_global: [B, D] 全局特征
+        """
+        if self.use_fallback:
+            feat_global = self.fallback(x)
+            B, D = feat_global.shape
+            # 伪造一个小的feature map
+            feat_map = feat_global.view(B, D, 1, 1).expand(B, D, 4, 4)
+            feat_map = feat_map.permute(0, 2, 3, 1)  # [B, 4, 4, D]
+            return feat_map, feat_global
+        
+        B, C, H, W = x.shape
+        
+        # DINOv2期望224x224或能被14整除的尺寸
+        if H != 224 or W != 224:
+            x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        
+        with torch.set_grad_enabled(not self.freeze_backbone):
+            # 获取patch tokens（不包含CLS token）
+            features = self.dino.forward_features(x)
+            
+            if isinstance(features, dict):
+                patch_tokens = features['x_norm_patchtokens']  # [B, N, D]
+                cls_token = features['x_norm_clstoken']  # [B, D]
+            else:
+                # 旧版本API
+                patch_tokens = features[:, 1:, :]  # 去掉CLS token
+                cls_token = features[:, 0, :]
+        
+        # 重塑为空间维度 (patch_size=14, 224/14=16)
+        h = w = 224 // 14  # = 16
+        feat_map = patch_tokens.view(B, h, w, self.dino_dim)  # [B, 16, 16, D]
+        
+        # 投影
+        feat_map_proj = self.proj_spatial(feat_map.permute(0, 3, 1, 2))  # [B, out_dim, 16, 16]
+        feat_map_proj = feat_map_proj.permute(0, 2, 3, 1)  # [B, 16, 16, out_dim]
+        
+        feat_global = self.proj(cls_token)  # [B, out_dim]
+        
+        return feat_map_proj, feat_global
+
+
+# ------------------------------
+# 小型视觉骨干（Fallback）
 # ------------------------------
 class TinyCNN(nn.Module):
     def __init__(self, out_dim: int = 256):
@@ -72,37 +217,228 @@ class TinyCNN(nn.Module):
 
 
 # ------------------------------
-# 节点特征编码 + Transformer
+# 图注意力层 (Graph Attention)
 # ------------------------------
-class HandNodeEncoder(nn.Module):
-    """
-    节点输入 = [xyz(3) | contact(1) | onehot_joint(21) | is_right(1)] 共 26 维
-    """
-    def __init__(self, in_dim: int = 26, hidden: int = 256, n_layers: int = 2, out_dim: int = 256):
+class GraphAttentionLayer(nn.Module):
+    """单头图注意力层"""
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
         super().__init__()
-        mlp = []
-        dim = in_dim
-        for _ in range(n_layers):
-            mlp += [nn.Linear(dim, hidden), nn.ReLU(inplace=True)]
-            dim = hidden
-        mlp += [nn.Linear(hidden, out_dim)]
-        self.mlp = nn.Sequential(*mlp)
+        self.W = nn.Linear(in_dim, out_dim, bias=False)
+        self.a = nn.Linear(2 * out_dim, 1, bias=False)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(dropout)
+        self.out_dim = out_dim
+    
+    def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: [B, N, in_dim] 节点特征
+            adj: [N, N] 邻接矩阵
+        Returns:
+            h_out: [B, N, out_dim]
+        """
+        B, N, _ = h.shape
+        
+        # 线性变换
+        Wh = self.W(h)  # [B, N, out_dim]
+        
+        # 计算注意力系数
+        # 拼接每对节点的特征
+        Wh_repeat_i = Wh.unsqueeze(2).expand(B, N, N, self.out_dim)  # [B, N, N, D]
+        Wh_repeat_j = Wh.unsqueeze(1).expand(B, N, N, self.out_dim)  # [B, N, N, D]
+        concat = torch.cat([Wh_repeat_i, Wh_repeat_j], dim=-1)  # [B, N, N, 2D]
+        
+        e = self.leaky_relu(self.a(concat).squeeze(-1))  # [B, N, N]
+        
+        # 只在邻接位置计算注意力
+        adj = adj.to(h.device)
+        mask = (adj == 0)
+        e = e.masked_fill(mask.unsqueeze(0), float('-inf'))
+        
+        alpha = F.softmax(e, dim=-1)  # [B, N, N]
+        alpha = self.dropout(alpha)
+        
+        # 加权聚合
+        h_out = torch.bmm(alpha, Wh)  # [B, N, out_dim]
+        
+        return h_out
 
-        enc = nn.TransformerEncoderLayer(
-            d_model=out_dim, nhead=8, dim_feedforward=out_dim * 2, batch_first=True, dropout=0.1, activation="gelu"
+
+class MultiHeadGraphAttention(nn.Module):
+    """多头图注意力"""
+    def __init__(self, in_dim: int, out_dim: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        assert out_dim % num_heads == 0
+        self.head_dim = out_dim // num_heads
+        self.num_heads = num_heads
+        
+        self.heads = nn.ModuleList([
+            GraphAttentionLayer(in_dim, self.head_dim, dropout) 
+            for _ in range(num_heads)
+        ])
+        self.proj = nn.Linear(out_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # 多头注意力
+        head_outputs = [head(h, adj) for head in self.heads]
+        h_multi = torch.cat(head_outputs, dim=-1)  # [B, N, out_dim]
+        
+        # 投影 + 残差
+        h_out = self.proj(h_multi)
+        h_out = self.dropout(h_out)
+        
+        # 如果维度匹配，加残差
+        if h.shape[-1] == h_out.shape[-1]:
+            h_out = h_out + h
+        return self.norm(h_out)
+
+
+# ------------------------------
+# Cross-Attention 模块
+# ------------------------------
+class CrossAttention(nn.Module):
+    """
+    Cross-Attention: Query来自关节特征，Key/Value来自图像特征图
+    """
+    def __init__(self, d_model: int = 256, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
         )
-        self.tr = nn.TransformerEncoder(enc, num_layers=4)
+    
+    def forward(self, query: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query: [B, N_q, D] 关节特征 (N_q=21)
+            kv: [B, N_kv, D] 图像特征 (N_kv=H'*W')
+        Returns:
+            out: [B, N_q, D]
+        """
+        B, N_q, D = query.shape
+        _, N_kv, _ = kv.shape
+        
+        # 投影
+        Q = self.q_proj(query).view(B, N_q, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(kv).view(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(kv).view(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Attention
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(Q, K.transpose(-2, -1)) * scale  # [B, H, N_q, N_kv]
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        
+        out = torch.matmul(attn, V)  # [B, H, N_q, head_dim]
+        out = out.transpose(1, 2).contiguous().view(B, N_q, D)
+        out = self.out_proj(out)
+        
+        # 残差 + LayerNorm
+        query = query + self.dropout(out)
+        query = self.norm1(query)
+        
+        # FFN
+        query = query + self.ffn(query)
+        query = self.norm2(query)
+        
+        return query
 
-        # FiLM 调制
-        self.film_gamma = nn.Linear(out_dim, out_dim)
-        self.film_beta = nn.Linear(out_dim, out_dim)
 
-    def forward(self, node_feats: torch.Tensor, img_emb: torch.Tensor) -> torch.Tensor:
-        H = self.mlp(node_feats)  # [B,21,D]
-        gamma = self.film_gamma(img_emb).unsqueeze(1)  # [B,1,D]
-        beta = self.film_beta(img_emb).unsqueeze(1)    # [B,1,D]
-        H = gamma * H + beta
-        H = self.tr(H)  # [B,21,D]
+# ------------------------------
+# 节点特征编码 + Graph Attention + Cross-Attention
+# ------------------------------
+class HandNodeEncoderV2(nn.Module):
+    """
+    改进的节点编码器：
+    1. MLP编码节点特征
+    2. Graph Attention建模骨骼结构
+    3. Cross-Attention融合图像特征
+    4. Transformer自注意力
+    """
+    def __init__(self, in_dim: int = 26, hidden: int = 256, out_dim: int = 256,
+                 num_gat_layers: int = 2, num_cross_attn_layers: int = 2,
+                 num_transformer_layers: int = 2, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        
+        # 1. 节点特征MLP
+        self.node_mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim),
+        )
+        
+        # 2. 图注意力层（建模骨骼连接）
+        self.gat_layers = nn.ModuleList([
+            MultiHeadGraphAttention(out_dim, out_dim, num_heads=4, dropout=dropout)
+            for _ in range(num_gat_layers)
+        ])
+        
+        # 3. Cross-Attention层（融合图像特征）
+        self.cross_attn_layers = nn.ModuleList([
+            CrossAttention(d_model=out_dim, num_heads=num_heads, dropout=dropout)
+            for _ in range(num_cross_attn_layers)
+        ])
+        
+        # 4. Transformer自注意力层
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=out_dim, nhead=num_heads, dim_feedforward=out_dim * 2,
+            batch_first=True, dropout=dropout, activation="gelu"
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+        
+        # 预计算邻接矩阵（注册为buffer）
+        adj = build_hand_adjacency_matrix(21, HAND_EDGES, self_loop=True)
+        self.register_buffer('adj', adj)
+    
+    def forward(self, node_feats: torch.Tensor, img_feat_map: torch.Tensor,
+                img_feat_global: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            node_feats: [B, 21, in_dim] 节点特征
+            img_feat_map: [B, H', W', D] 图像空间特征
+            img_feat_global: [B, D] 全局图像特征（可选）
+        Returns:
+            H: [B, 21, out_dim]
+        """
+        B = node_feats.shape[0]
+        
+        # 1. MLP编码
+        H = self.node_mlp(node_feats)  # [B, 21, D]
+        
+        # 2. 图注意力（建模骨骼结构）
+        for gat in self.gat_layers:
+            H = gat(H, self.adj)  # [B, 21, D]
+        
+        # 3. Cross-Attention（融合图像特征）
+        # 将图像特征展平为序列
+        H_img, W_img, D = img_feat_map.shape[1], img_feat_map.shape[2], img_feat_map.shape[3]
+        img_seq = img_feat_map.view(B, H_img * W_img, D)  # [B, H'*W', D]
+        
+        for cross_attn in self.cross_attn_layers:
+            H = cross_attn(H, img_seq)  # [B, 21, D]
+        
+        # 4. Transformer自注意力
+        H = self.transformer(H)  # [B, 21, D]
+        
         return H
 
 
@@ -148,8 +484,6 @@ class TripleDecoder(nn.Module):
         S_lr = torch.einsum('bnd,de,bme->bnm', H, self.W_lr, H)  # (left=j, right=k)
 
         # 三元联合打分 (允许 i=j=k)
-        # comb[b, i, j, k] = logits_base[i] + logits_left[j] + logits_right[k]
-        #                   + S_bl[i,j] + S_br[i,k] + S_lr[j,k]
         comb = (
             logits_base[:, :, None, None] +
             logits_left[:, None, :, None] +
@@ -171,24 +505,47 @@ class TripleDecoder(nn.Module):
 
 
 # ------------------------------
-# 顶层模型
+# 顶层模型 V2
 # ------------------------------
 class Hand2GripperModel(nn.Module):
-    def __init__(self, d_model: int = 256, img_size: int = 256):
+    """
+    改进版模型：
+    - DINOv2预训练骨干
+    - Cross-Attention融合图像特征
+    - 图注意力建模手指骨骼结构
+    """
+    def __init__(self, d_model: int = 256, img_size: int = 256,
+                 backbone: str = "dinov2_vits14", freeze_backbone: bool = True,
+                 use_dino: bool = True):
         super().__init__()
         self.img_size = img_size
         self.crop_scale = 1.2
-        self.backbone = TinyCNN(out_dim=d_model)
-        self.encoder = HandNodeEncoder(in_dim=26, hidden=d_model, n_layers=2, out_dim=d_model)
+        self.use_dino = use_dino
+        
+        # 视觉骨干
+        if use_dino:
+            self.backbone = DINOv2Backbone(
+                model_name=backbone, out_dim=d_model, freeze_backbone=freeze_backbone
+            )
+        else:
+            self.backbone = TinyCNN(out_dim=d_model)
+        
+        # 节点编码器（改进版）
+        self.encoder = HandNodeEncoderV2(
+            in_dim=26, hidden=d_model, out_dim=d_model,
+            num_gat_layers=2, num_cross_attn_layers=2,
+            num_transformer_layers=2, num_heads=8, dropout=0.1
+        )
+        
+        # 解码器
         self.decoder = TripleDecoder(d_model=d_model)
     
     def _load_checkpoint(self, checkpoint_path: str):
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         if 'state_dict' in checkpoint:
-            self.load_state_dict(checkpoint['state_dict'])
+            self.load_state_dict(checkpoint['state_dict'], strict=False)
         else:
-            self.load_state_dict(checkpoint)
-
+            self.load_state_dict(checkpoint, strict=False)
 
     @staticmethod
     def _normalize_keypoints_xyz(kp3d: torch.Tensor) -> torch.Tensor:
@@ -217,51 +574,36 @@ class Hand2GripperModel(nn.Module):
         palm_centered = palm_pts - palm_center  # [B,5,3]
 
         # SVD 找最小特征值对应的特征向量作为法向量
-        # palm_centered: [B,5,3] -> 对每个batch做SVD
         U, S, Vh = torch.linalg.svd(palm_centered, full_matrices=False)  # Vh: [B,3,3]
         normal = Vh[:, 2, :]  # 最小奇异值对应的右奇异向量，即法向量 [B,3]
 
-        # Step 3: 确保法向量朝向掌心（与中指方向叉积判断）
-        # 中指方向：从掌根(0)到中指MCP(9)
+        # Step 3: 确保法向量朝向掌心
         finger_dir = kp[:, 9, :] - kp[:, 0, :]  # [B,3]
         finger_dir = finger_dir / (finger_dir.norm(dim=1, keepdim=True) + 1e-8)
 
-        # 从掌根到中指tip的方向用于判断
-        # 使用中指MCP到中指PIP的方向作为"向上"参考
         up_ref = kp[:, 10, :] - kp[:, 9, :]  # [B,3]
         up_ref = up_ref / (up_ref.norm(dim=1, keepdim=True) + 1e-8)
 
-        # 计算预期的法向量方向：finger_dir × up_ref 应该大致指向掌心
         expected_normal = torch.cross(finger_dir, up_ref, dim=1)  # [B,3]
-
-        # 如果 normal 与 expected_normal 方向相反，则翻转
         dot = (normal * expected_normal).sum(dim=1, keepdim=True)  # [B,1]
-        normal = normal * torch.sign(dot + 1e-8)  # 确保同向
+        normal = normal * torch.sign(dot + 1e-8)
 
-        # Step 4: 构建旋转矩阵，将 normal 旋转到 x 轴正方向
-        # 目标：normal -> [1, 0, 0]
+        # Step 4: 构建旋转矩阵
         target = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
-        target = target.unsqueeze(0).expand(B, 3)  # [B,3]
+        target = target.unsqueeze(0).expand(B, 3)
 
-        # 使用 Rodrigues 公式计算旋转矩阵
-        normal = normal / (normal.norm(dim=1, keepdim=True) + 1e-8)  # 归一化
+        normal = normal / (normal.norm(dim=1, keepdim=True) + 1e-8)
 
-        # 旋转轴 = normal × target
-        axis = torch.cross(normal, target, dim=1)  # [B,3]
+        axis = torch.cross(normal, target, dim=1)
         axis_norm = axis.norm(dim=1, keepdim=True) + 1e-8
-        axis = axis / axis_norm  # [B,3]
+        axis = axis / axis_norm
 
-        # 旋转角 cos(theta) = normal · target
-        cos_theta = (normal * target).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)  # [B,1]
-        sin_theta = axis_norm.squeeze(-1).unsqueeze(-1)  # [B,1]
+        cos_theta = (normal * target).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
+        sin_theta = axis_norm.squeeze(-1).unsqueeze(-1)
 
-        # 处理 normal ≈ target 或 normal ≈ -target 的特殊情况
-        # 当 axis_norm 很小时，说明两向量平行
-        is_parallel = (axis_norm.squeeze(-1) < 1e-6)  # [B]
-        is_same_dir = (cos_theta.squeeze(-1) > 0)  # [B]
+        is_parallel = (axis_norm.squeeze(-1) < 1e-6)
+        is_same_dir = (cos_theta.squeeze(-1) > 0)
 
-        # Rodrigues: R = I + sin(θ)[K] + (1-cos(θ))[K]^2
-        # 其中 [K] 是 axis 的反对称矩阵
         K = torch.zeros(B, 3, 3, device=device, dtype=dtype)
         K[:, 0, 1] = -axis[:, 2]
         K[:, 0, 2] = axis[:, 1]
@@ -273,33 +615,30 @@ class Hand2GripperModel(nn.Module):
         I = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(B, 3, 3)
         R = I + sin_theta.unsqueeze(-1) * K + (1 - cos_theta).unsqueeze(-1) * (K @ K)
 
-        # 处理特殊情况
         for b in range(B):
             if is_parallel[b]:
                 if is_same_dir[b]:
                     R[b] = torch.eye(3, device=device, dtype=dtype)
                 else:
-                    # 180度旋转，绕y轴或z轴
                     R[b] = torch.diag(torch.tensor([-1.0, 1.0, -1.0], device=device, dtype=dtype))
 
-        # Step 5: 应用旋转
-        kp = torch.bmm(kp, R.transpose(1, 2))  # [B,21,3] @ [B,3,3] -> [B,21,3]
+        kp = torch.bmm(kp, R.transpose(1, 2))
 
-        # Step 6: 全局尺度归一化
-        dist = torch.norm(kp, dim=-1)  # [B,21]
-        scale = dist.mean(dim=1, keepdim=True).clamp(min=1e-6)  # [B,1]
+        dist = torch.norm(kp, dim=-1)
+        scale = dist.mean(dim=1, keepdim=True).clamp(min=1e-6)
         kp = kp / scale.unsqueeze(-1)
 
         return kp
 
     @staticmethod
-    def _build_node_features(kp_xyz_norm: torch.Tensor, contact: torch.Tensor, is_right: torch.Tensor) -> torch.Tensor:
+    def _build_node_features(kp_xyz_norm: torch.Tensor, contact: torch.Tensor, 
+                              is_right: torch.Tensor) -> torch.Tensor:
         """拼接 [xyz | contact | onehot | is_right] -> [B,21,26]"""
         B, N, _ = kp_xyz_norm.shape
-        onehot = torch.eye(N, device=kp_xyz_norm.device).unsqueeze(0).repeat(B, 1, 1)  # [B,21,21]
-        contact_f = contact.unsqueeze(-1)                                              # [B,21,1]
-        isr = is_right.view(B, 1, 1).repeat(1, N, 1).float()                           # [B,21,1]
-        feats = torch.cat([kp_xyz_norm, contact_f, onehot, isr], dim=-1)               # [B,21,26]
+        onehot = torch.eye(N, device=kp_xyz_norm.device).unsqueeze(0).repeat(B, 1, 1)
+        contact_f = contact.unsqueeze(-1)
+        isr = is_right.view(B, 1, 1).repeat(1, N, 1).float()
+        feats = torch.cat([kp_xyz_norm, contact_f, onehot, isr], dim=-1)
         return feats
 
     @staticmethod
@@ -420,20 +759,32 @@ class Hand2GripperModel(nn.Module):
             x2i = max(x2i, x1i + 1)
             y2i = max(y2i, y1i + 1)
             patch = color[b:b+1, :, y1i:y2i, x1i:x2i]
-            patch = F.interpolate(patch, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+            patch = F.interpolate(patch, size=(self.img_size, self.img_size), 
+                                   mode="bilinear", align_corners=False)
             crops.append(patch)
         crop_img = torch.cat(crops, dim=0)
         return crop_img  # [B,3,S,S]
 
     def forward(self, img_crop: torch.Tensor, keypoints_3d: torch.Tensor,
                 contact: torch.Tensor, is_right: torch.Tensor) -> Dict[str, torch.Tensor]:
+        
+        # 提取图像特征
+        if self.use_dino:
+            img_feat_map, img_emb = self.backbone(img_crop)  # [B,H',W',D], [B,D]
+        else:
+            img_emb = self.backbone(img_crop)  # [B,D]
+            B, D = img_emb.shape
+            # 伪造feature map用于cross-attention
+            img_feat_map = img_emb.view(B, 1, 1, D).expand(B, 4, 4, D)
 
-        img_emb = self.backbone(img_crop)                              # [B,D]
+        # 关键点归一化与节点特征构建
+        kp_xyz_norm = self._normalize_keypoints_xyz(keypoints_3d)
+        node_feats = self._build_node_features(kp_xyz_norm, contact, is_right)
 
-        kp_xyz_norm = self._normalize_keypoints_xyz(keypoints_3d)  # [B,21,3]
-        node_feats = self._build_node_features(kp_xyz_norm, contact, is_right)  # [B,21,26]
-        H = self.encoder(node_feats, img_emb)                          # [B,21,D]
+        # 编码（图注意力 + Cross-Attention + Transformer）
+        H = self.encoder(node_feats, img_feat_map, img_emb)
 
+        # 解码
         logits_base, logits_left, logits_right, S_bl, S_br, S_lr, pred_triple = self.decoder(H)
 
         return {
@@ -467,20 +818,17 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
     
-    # 手指连接关系：每根手指从掌根或MCP连接到指尖
-    # 0: 掌根, 1-4: 拇指, 5-8: 食指, 9-12: 中指, 13-16: 无名指, 17-20: 小指
     finger_links = [
-        [0, 1, 2, 3, 4],      # 拇指
-        [0, 5, 6, 7, 8],      # 食指
-        [0, 9, 10, 11, 12],   # 中指
-        [0, 13, 14, 15, 16],  # 无名指
-        [0, 17, 18, 19, 20],  # 小指
+        [0, 1, 2, 3, 4],
+        [0, 5, 6, 7, 8],
+        [0, 9, 10, 11, 12],
+        [0, 13, 14, 15, 16],
+        [0, 17, 18, 19, 20],
     ]
     finger_colors = ['red', 'orange', 'green', 'blue', 'purple']
     
     fig = plt.figure(figsize=(14, 6))
     
-    # 归一化前
     ax1 = fig.add_subplot(121, projection='3d')
     ax1.set_title('Before Normalization')
     for finger_idx, links in enumerate(finger_links):
@@ -488,7 +836,6 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
         ax1.plot(pts[:, 0], pts[:, 1], pts[:, 2], 'o-', 
                  color=finger_colors[finger_idx], linewidth=2, markersize=4)
     ax1.scatter(*kp_before[0], color='black', s=100, marker='*', label='Wrist')
-    # 绘制掌心平面点
     palm_idx = [0, 5, 9, 13, 17]
     palm_pts = kp_before[palm_idx]
     ax1.scatter(palm_pts[:, 0], palm_pts[:, 1], palm_pts[:, 2], 
@@ -499,7 +846,6 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
     ax1.legend()
     _set_axes_equal(ax1)
     
-    # 归一化后
     ax2 = fig.add_subplot(122, projection='3d')
     ax2.set_title('After Normalization (Palm normal → +X)')
     for finger_idx, links in enumerate(finger_links):
@@ -507,11 +853,9 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
         ax2.plot(pts[:, 0], pts[:, 1], pts[:, 2], 'o-', 
                  color=finger_colors[finger_idx], linewidth=2, markersize=4)
     ax2.scatter(*kp_after[0], color='black', s=100, marker='*', label='Wrist (origin)')
-    # 绘制掌心平面点
     palm_pts = kp_after[palm_idx]
     ax2.scatter(palm_pts[:, 0], palm_pts[:, 1], palm_pts[:, 2], 
                 color='cyan', s=60, marker='s', label='Palm plane')
-    # 绘制坐标轴
     ax2.quiver(0, 0, 0, 0.5, 0, 0, color='r', arrow_length_ratio=0.1, linewidth=2)
     ax2.quiver(0, 0, 0, 0, 0.5, 0, color='g', arrow_length_ratio=0.1, linewidth=2)
     ax2.quiver(0, 0, 0, 0, 0, 0.5, color='b', arrow_length_ratio=0.1, linewidth=2)
@@ -534,7 +878,6 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
 
 
 def _set_axes_equal(ax):
-    """设置3D坐标轴等比例"""
     limits = np.array([
         ax.get_xlim3d(),
         ax.get_ylim3d(),
@@ -548,7 +891,7 @@ def _set_axes_equal(ax):
 
 
 # ------------------------------
-# 演示: 从npz文件读取数据并可视化
+# 演示
 # ------------------------------
 if __name__ == "__main__":
     import argparse
@@ -558,6 +901,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="", help="Path to model checkpoint")
     parser.add_argument("--save_vis", type=str, default=None, help="Path to save visualization")
     parser.add_argument("--use_random", action="store_true", help="Use random data instead of npz file")
+    parser.add_argument("--use_dino", action="store_true", help="Use DINOv2 backbone")
     args = parser.parse_args()
     
     torch.manual_seed(0)
@@ -565,7 +909,12 @@ if __name__ == "__main__":
     print(f"Device: {device}")
 
     # 初始化模型
-    model = Hand2GripperModel(d_model=256, img_size=256).to(device)
+    model = Hand2GripperModel(
+        d_model=256, img_size=256, use_dino=args.use_dino
+    ).to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     
     # 加载checkpoint
     if args.checkpoint and os.path.exists(args.checkpoint):
@@ -576,56 +925,38 @@ if __name__ == "__main__":
     model.eval()
 
     if args.npz and os.path.exists(args.npz) and not args.use_random:
-        # ===== 从npz文件读取数据 =====
         print(f"Loading data from {args.npz}")
         data = np.load(args.npz, allow_pickle=True)
         
-        # 读取数据（参考train.py中的格式）
-        # img_rgb: (H, W, 3), uint8 或 float
-        # bbox: (4,), [x1, y1, x2, y2]
-        # kpts_3d: (21, 3), float
-        # contact_logits: (21,), float
-        # is_right: (1,) 或标量, int
-        # selected_gripper_blr_ids: (3,), int (可选，用于对比GT)
+        img_rgb = data["img_rgb"]
+        bbox = data["bbox"]
+        kpts_3d = data["kpts_3d"]
+        contact_logits = data["contact_logits"]
+        is_right = data["is_right"]
         
-        img_rgb = data["img_rgb"]  # (H, W, 3)
-        bbox = data["bbox"]  # (4,)
-        kpts_3d = data["kpts_3d"]  # (21, 3)
-        contact_logits = data["contact_logits"]  # (21,)
-        is_right = data["is_right"]  # (1,) 或标量
-        
-        # 检查是否有GT标签
         has_gt = "selected_gripper_blr_ids" in data
         if has_gt:
-            gt_blr = data["selected_gripper_blr_ids"]  # (3,)
+            gt_blr = data["selected_gripper_blr_ids"]
             print(f"Ground truth (base, left, right): {gt_blr}")
         
-        # 转换为tensor
-        img_rgb_t = model._read_color(img_rgb).to(device)  # [1,3,H,W]
-        bbox_t = model._read_bbox(bbox).to(device)  # [1,4]
-        kpts_3d_t = model._read_keypoints_3d(kpts_3d).to(device)  # [1,21,3]
-        contact_t = model._read_contact(contact_logits).to(device)  # [1,21]
-        is_right_t = model._read_is_right(is_right).to(device)  # [1]
-        
-        print(f"Image shape: {img_rgb.shape}")
-        print(f"Bbox: {bbox}")
-        print(f"Keypoints 3D shape: {kpts_3d.shape}")
-        print(f"Is right hand: {is_right}")
+        img_rgb_t = model._read_color(img_rgb).to(device)
+        bbox_t = model._read_bbox(bbox).to(device)
+        kpts_3d_t = model._read_keypoints_3d(kpts_3d).to(device)
+        contact_t = model._read_contact(contact_logits).to(device)
+        is_right_t = model._read_is_right(is_right).to(device)
         
     else:
-        # ===== 使用随机数据 =====
         print("Using random data for demo...")
         H, W = 480, 640
         
-        img_rgb = np.random.rand(H, W, 3).astype(np.float32)  # (H,W,3)
-        bbox = np.array([120, 80, 320, 360], dtype=np.int32)  # (4,)
-        kpts_3d = np.random.randn(21, 3).astype(np.float32) * 0.05  # (21,3)
-        contact_logits = np.random.rand(21).astype(np.float32)  # (21,)
-        is_right = np.array([1], dtype=np.int64)  # (1,)
+        img_rgb = np.random.rand(H, W, 3).astype(np.float32)
+        bbox = np.array([120, 80, 320, 360], dtype=np.int32)
+        kpts_3d = np.random.randn(21, 3).astype(np.float32) * 0.05
+        contact_logits = np.random.rand(21).astype(np.float32)
+        is_right = np.array([1], dtype=np.int64)
         
         has_gt = False
         
-        # 转换为tensor
         img_rgb_t = model._read_color(img_rgb).to(device)
         bbox_t = model._read_bbox(bbox).to(device)
         kpts_3d_t = model._read_keypoints_3d(kpts_3d).to(device)

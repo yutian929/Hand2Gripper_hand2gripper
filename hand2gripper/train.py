@@ -302,7 +302,15 @@ def main(args):
                             num_workers=args.num_workers, pin_memory=True)
 
     # 模型/优化器
-    model = Hand2GripperModel(d_model=256, img_size=256).to(device)
+    model = Hand2GripperModel(
+        d_model=256, img_size=256, 
+        use_dino=args.use_dino,
+        freeze_backbone=args.freeze_backbone
+    ).to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
     lw = LossWeights()
@@ -311,10 +319,9 @@ def main(args):
     if args.resume:
         if os.path.exists(args.resume):
             print(f"Loading pretrained model from {args.resume}")
-            model.load_state_dict(torch.load(args.resume, map_location=device))
+            model.load_state_dict(torch.load(args.resume, map_location=device), strict=False)
             print("Model loaded successfully")
             
-            # 如果指定了加载优化器状态
             if args.resume_optimizer:
                 optimizer_path = args.resume.replace('.pt', '_optimizer.pt')
                 if os.path.exists(optimizer_path):
@@ -362,7 +369,6 @@ def main(args):
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
                 preprocessed_crop_img_rgb = model._crop_and_resize(img_rgb_t, bbox_t)
                 out = model.forward(preprocessed_crop_img_rgb, kpts_3d_t, contact_logits_t, is_right_t.view(-1))
-                # 关键点规范化（与模型内部一致）用于距离先验
                 kp = kpts_3d_t.clone()
                 wrist = kp[:, 0:1, :]
                 kp = kp - wrist
@@ -441,18 +447,22 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", type=str, default="", help="真实数据根目录（含各 sample.npz 文件）")
-    parser.add_argument("--epochs", type=int, default=100, help="训练轮数，None表示自动训练直到收敛")
+    parser.add_argument("--dataset_root", type=str, default="", help="真实数据根目录")
+    parser.add_argument("--epochs", type=int, default=100, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=64, help="批大小")
     parser.add_argument("--lr", type=float, default=3e-4, help="学习率")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例（真实数据时生效）")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--save", type=str, default="hand2gripper.pt", help="模型保存路径")
     parser.add_argument("--patience", type=int, default=15, help="早停耐心值")
     parser.add_argument("--stability_window", type=int, default=10, help="稳定性检测窗口大小")
     parser.add_argument("--stability_threshold", type=float, default=0.005, help="稳定性阈值")
-    parser.add_argument("--resume", type=str, default="", help="从预训练模型继续训练（模型文件路径）")
-    parser.add_argument("--resume_optimizer", action="store_true", help="同时加载优化器状态（需要保存的优化器状态文件）")
+    parser.add_argument("--resume", type=str, default="", help="从预训练模型继续训练")
+    parser.add_argument("--resume_optimizer", action="store_true", help="同时加载优化器状态")
+    # 新增参数
+    parser.add_argument("--use_dino", action="store_true", help="使用DINOv2作为视觉骨干")
+    parser.add_argument("--freeze_backbone", action="store_true", default=True, help="冻结DINOv2参数")
+    parser.add_argument("--no_freeze_backbone", action="store_false", dest="freeze_backbone", help="不冻结DINOv2参数")
     args = parser.parse_args()
     main(args)
