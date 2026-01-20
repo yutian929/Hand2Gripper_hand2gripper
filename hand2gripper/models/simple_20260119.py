@@ -20,15 +20,8 @@ Hand-to-Gripper (2-finger) Mapping Model (Ordered Base/Left/Right)
 - pred_triple:  [B,3]  (i_base*, j_left*, k_right*)  由三元联合打分 comb 最大化得到
 - img_emb:      [B,D]
 - node_emb:     [B,21,D]
-
-关键点归一化流程:
-1. 将掌根(joint 0)移动到原点
-2. 用掌根(0)和四指根部(5,9,13,17)拟合平面，计算掌心法向量
-3. 将法向量旋转到x轴正方向（掌心朝x正向）
-4. 全局尺度归一化（所有点到原点距离的均值为1）
 """
 
-import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -192,104 +185,13 @@ class Hand2GripperModel(nn.Module):
 
     @staticmethod
     def _normalize_keypoints_xyz(kp3d: torch.Tensor) -> torch.Tensor:
-        """
-        手掌姿态归一化：
-        1. 将掌根(0)移动到原点
-        2. 用掌根(0)和四指根部(5,9,13,17)拟合平面，计算法向量
-        3. 将法向量旋转到x轴正方向（掌心朝x正向）
-        4. 全局尺度归一化
-        """
+        """不镜像，只做 wrist(0) 居中 + 全局尺度归一"""
         kp = kp3d.clone()
-        B = kp.shape[0]
-        device = kp.device
-        dtype = kp.dtype
-
-        # Step 1: 掌根居中
-        wrist = kp[:, 0:1, :]  # [B,1,3]
+        wrist = kp[:, 0:1, :]
         kp = kp - wrist
-
-        # Step 2: 提取5个关键点拟合平面
-        palm_indices = [0, 5, 9, 13, 17]  # 掌根 + 四指MCP关节
-        palm_pts = kp[:, palm_indices, :]  # [B,5,3]
-
-        # 计算中心并去中心
-        palm_center = palm_pts.mean(dim=1, keepdim=True)  # [B,1,3]
-        palm_centered = palm_pts - palm_center  # [B,5,3]
-
-        # SVD 找最小特征值对应的特征向量作为法向量
-        # palm_centered: [B,5,3] -> 对每个batch做SVD
-        U, S, Vh = torch.linalg.svd(palm_centered, full_matrices=False)  # Vh: [B,3,3]
-        normal = Vh[:, 2, :]  # 最小奇异值对应的右奇异向量，即法向量 [B,3]
-
-        # Step 3: 确保法向量朝向掌心（与中指方向叉积判断）
-        # 中指方向：从掌根(0)到中指MCP(9)
-        finger_dir = kp[:, 9, :] - kp[:, 0, :]  # [B,3]
-        finger_dir = finger_dir / (finger_dir.norm(dim=1, keepdim=True) + 1e-8)
-
-        # 从掌根到中指tip的方向用于判断
-        # 使用中指MCP到中指PIP的方向作为"向上"参考
-        up_ref = kp[:, 10, :] - kp[:, 9, :]  # [B,3]
-        up_ref = up_ref / (up_ref.norm(dim=1, keepdim=True) + 1e-8)
-
-        # 计算预期的法向量方向：finger_dir × up_ref 应该大致指向掌心
-        expected_normal = torch.cross(finger_dir, up_ref, dim=1)  # [B,3]
-
-        # 如果 normal 与 expected_normal 方向相反，则翻转
-        dot = (normal * expected_normal).sum(dim=1, keepdim=True)  # [B,1]
-        normal = normal * torch.sign(dot + 1e-8)  # 确保同向
-
-        # Step 4: 构建旋转矩阵，将 normal 旋转到 x 轴正方向
-        # 目标：normal -> [1, 0, 0]
-        target = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
-        target = target.unsqueeze(0).expand(B, 3)  # [B,3]
-
-        # 使用 Rodrigues 公式计算旋转矩阵
-        normal = normal / (normal.norm(dim=1, keepdim=True) + 1e-8)  # 归一化
-
-        # 旋转轴 = normal × target
-        axis = torch.cross(normal, target, dim=1)  # [B,3]
-        axis_norm = axis.norm(dim=1, keepdim=True) + 1e-8
-        axis = axis / axis_norm  # [B,3]
-
-        # 旋转角 cos(theta) = normal · target
-        cos_theta = (normal * target).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)  # [B,1]
-        sin_theta = axis_norm.squeeze(-1).unsqueeze(-1)  # [B,1]
-
-        # 处理 normal ≈ target 或 normal ≈ -target 的特殊情况
-        # 当 axis_norm 很小时，说明两向量平行
-        is_parallel = (axis_norm.squeeze(-1) < 1e-6)  # [B]
-        is_same_dir = (cos_theta.squeeze(-1) > 0)  # [B]
-
-        # Rodrigues: R = I + sin(θ)[K] + (1-cos(θ))[K]^2
-        # 其中 [K] 是 axis 的反对称矩阵
-        K = torch.zeros(B, 3, 3, device=device, dtype=dtype)
-        K[:, 0, 1] = -axis[:, 2]
-        K[:, 0, 2] = axis[:, 1]
-        K[:, 1, 0] = axis[:, 2]
-        K[:, 1, 2] = -axis[:, 0]
-        K[:, 2, 0] = -axis[:, 1]
-        K[:, 2, 1] = axis[:, 0]
-
-        I = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(B, 3, 3)
-        R = I + sin_theta.unsqueeze(-1) * K + (1 - cos_theta).unsqueeze(-1) * (K @ K)
-
-        # 处理特殊情况
-        for b in range(B):
-            if is_parallel[b]:
-                if is_same_dir[b]:
-                    R[b] = torch.eye(3, device=device, dtype=dtype)
-                else:
-                    # 180度旋转，绕y轴或z轴
-                    R[b] = torch.diag(torch.tensor([-1.0, 1.0, -1.0], device=device, dtype=dtype))
-
-        # Step 5: 应用旋转
-        kp = torch.bmm(kp, R.transpose(1, 2))  # [B,21,3] @ [B,3,3] -> [B,21,3]
-
-        # Step 6: 全局尺度归一化
-        dist = torch.norm(kp, dim=-1)  # [B,21]
-        scale = dist.mean(dim=1, keepdim=True).clamp(min=1e-6)  # [B,1]
+        dist = torch.norm(kp, dim=-1)
+        scale = dist.mean(dim=1, keepdim=True).clamp(min=1e-6)
         kp = kp / scale.unsqueeze(-1)
-
         return kp
 
     @staticmethod
@@ -450,224 +352,61 @@ class Hand2GripperModel(nn.Module):
 
 
 # ------------------------------
-# 可视化工具
-# ------------------------------
-def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray, 
-                              title: str = "Hand Keypoints Normalization",
-                              save_path: str = None):
-    """
-    可视化手部关键点归一化前后的对比
-    
-    Args:
-        kp_before: [21, 3] 归一化前的关键点
-        kp_after:  [21, 3] 归一化后的关键点
-        title: 图表标题
-        save_path: 保存路径，None则显示
-    """
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
-    
-    # 手指连接关系：每根手指从掌根或MCP连接到指尖
-    # 0: 掌根, 1-4: 拇指, 5-8: 食指, 9-12: 中指, 13-16: 无名指, 17-20: 小指
-    finger_links = [
-        [0, 1, 2, 3, 4],      # 拇指
-        [0, 5, 6, 7, 8],      # 食指
-        [0, 9, 10, 11, 12],   # 中指
-        [0, 13, 14, 15, 16],  # 无名指
-        [0, 17, 18, 19, 20],  # 小指
-    ]
-    finger_colors = ['red', 'orange', 'green', 'blue', 'purple']
-    
-    fig = plt.figure(figsize=(14, 6))
-    
-    # 归一化前
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax1.set_title('Before Normalization')
-    for finger_idx, links in enumerate(finger_links):
-        pts = kp_before[links]
-        ax1.plot(pts[:, 0], pts[:, 1], pts[:, 2], 'o-', 
-                 color=finger_colors[finger_idx], linewidth=2, markersize=4)
-    ax1.scatter(*kp_before[0], color='black', s=100, marker='*', label='Wrist')
-    # 绘制掌心平面点
-    palm_idx = [0, 5, 9, 13, 17]
-    palm_pts = kp_before[palm_idx]
-    ax1.scatter(palm_pts[:, 0], palm_pts[:, 1], palm_pts[:, 2], 
-                color='cyan', s=60, marker='s', label='Palm plane')
-    ax1.set_xlabel('X')
-    ax1.set_ylabel('Y')
-    ax1.set_zlabel('Z')
-    ax1.legend()
-    _set_axes_equal(ax1)
-    
-    # 归一化后
-    ax2 = fig.add_subplot(122, projection='3d')
-    ax2.set_title('After Normalization (Palm normal → +X)')
-    for finger_idx, links in enumerate(finger_links):
-        pts = kp_after[links]
-        ax2.plot(pts[:, 0], pts[:, 1], pts[:, 2], 'o-', 
-                 color=finger_colors[finger_idx], linewidth=2, markersize=4)
-    ax2.scatter(*kp_after[0], color='black', s=100, marker='*', label='Wrist (origin)')
-    # 绘制掌心平面点
-    palm_pts = kp_after[palm_idx]
-    ax2.scatter(palm_pts[:, 0], palm_pts[:, 1], palm_pts[:, 2], 
-                color='cyan', s=60, marker='s', label='Palm plane')
-    # 绘制坐标轴
-    ax2.quiver(0, 0, 0, 0.5, 0, 0, color='r', arrow_length_ratio=0.1, linewidth=2)
-    ax2.quiver(0, 0, 0, 0, 0.5, 0, color='g', arrow_length_ratio=0.1, linewidth=2)
-    ax2.quiver(0, 0, 0, 0, 0, 0.5, color='b', arrow_length_ratio=0.1, linewidth=2)
-    ax2.text(0.55, 0, 0, '+X (palm normal)', fontsize=8)
-    ax2.set_xlabel('X')
-    ax2.set_ylabel('Y')
-    ax2.set_zlabel('Z')
-    ax2.legend()
-    _set_axes_equal(ax2)
-    
-    fig.suptitle(title, fontsize=12)
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved visualization to {save_path}")
-    else:
-        plt.show()
-    plt.close()
-
-
-def _set_axes_equal(ax):
-    """设置3D坐标轴等比例"""
-    limits = np.array([
-        ax.get_xlim3d(),
-        ax.get_ylim3d(),
-        ax.get_zlim3d(),
-    ])
-    origin = np.mean(limits, axis=1)
-    radius = 0.5 * np.max(np.abs(limits[:, 1] - limits[:, 0]))
-    ax.set_xlim3d([origin[0] - radius, origin[0] + radius])
-    ax.set_ylim3d([origin[1] - radius, origin[1] + radius])
-    ax.set_zlim3d([origin[2] - radius, origin[2] + radius])
-
-
-# ------------------------------
-# 演示: 从npz文件读取数据并可视化
+# 演示: 随机数据跑一次 forward
 # ------------------------------
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Hand2Gripper Model Demo")
-    parser.add_argument("--npz", type=str, default="", help="Path to .npz sample file")
-    parser.add_argument("--checkpoint", type=str, default="", help="Path to model checkpoint")
-    parser.add_argument("--save_vis", type=str, default=None, help="Path to save visualization")
-    parser.add_argument("--use_random", action="store_true", help="Use random data instead of npz file")
-    args = parser.parse_args()
-    
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
 
-    # 初始化模型
+    B, H, W = 2, 480, 640
     model = Hand2GripperModel(d_model=256, img_size=256).to(device)
-    
-    # 加载checkpoint
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        print(f"Loading checkpoint from {args.checkpoint}")
-        model._load_checkpoint(args.checkpoint)
-        print("Checkpoint loaded successfully")
-    
     model.eval()
 
-    if args.npz and os.path.exists(args.npz) and not args.use_random:
-        # ===== 从npz文件读取数据 =====
-        print(f"Loading data from {args.npz}")
-        data = np.load(args.npz, allow_pickle=True)
-        
-        # 读取数据（参考train.py中的格式）
-        # img_rgb: (H, W, 3), uint8 或 float
-        # bbox: (4,), [x1, y1, x2, y2]
-        # kpts_3d: (21, 3), float
-        # contact_logits: (21,), float
-        # is_right: (1,) 或标量, int
-        # selected_gripper_blr_ids: (3,), int (可选，用于对比GT)
-        
-        img_rgb = data["img_rgb"]  # (H, W, 3)
-        bbox = data["bbox"]  # (4,)
-        kpts_3d = data["kpts_3d"]  # (21, 3)
-        contact_logits = data["contact_logits"]  # (21,)
-        is_right = data["is_right"]  # (1,) 或标量
-        
-        # 检查是否有GT标签
-        has_gt = "selected_gripper_blr_ids" in data
-        if has_gt:
-            gt_blr = data["selected_gripper_blr_ids"]  # (3,)
-            print(f"Ground truth (base, left, right): {gt_blr}")
-        
-        # 转换为tensor
-        img_rgb_t = model._read_color(img_rgb).to(device)  # [1,3,H,W]
-        bbox_t = model._read_bbox(bbox).to(device)  # [1,4]
-        kpts_3d_t = model._read_keypoints_3d(kpts_3d).to(device)  # [1,21,3]
-        contact_t = model._read_contact(contact_logits).to(device)  # [1,21]
-        is_right_t = model._read_is_right(is_right).to(device)  # [1]
-        
-        print(f"Image shape: {img_rgb.shape}")
-        print(f"Bbox: {bbox}")
-        print(f"Keypoints 3D shape: {kpts_3d.shape}")
-        print(f"Is right hand: {is_right}")
-        
-    else:
-        # ===== 使用随机数据 =====
-        print("Using random data for demo...")
-        H, W = 480, 640
-        
-        img_rgb = np.random.rand(H, W, 3).astype(np.float32)  # (H,W,3)
-        bbox = np.array([120, 80, 320, 360], dtype=np.int32)  # (4,)
-        kpts_3d = np.random.randn(21, 3).astype(np.float32) * 0.05  # (21,3)
-        contact_logits = np.random.rand(21).astype(np.float32)  # (21,)
-        is_right = np.array([1], dtype=np.int64)  # (1,)
-        
-        has_gt = False
-        
-        # 转换为tensor
-        img_rgb_t = model._read_color(img_rgb).to(device)
-        bbox_t = model._read_bbox(bbox).to(device)
-        kpts_3d_t = model._read_keypoints_3d(kpts_3d).to(device)
-        contact_t = model._read_contact(contact_logits).to(device)
-        is_right_t = model._read_is_right(is_right).to(device)
+    # 使用 numpy 生成随机样本
+    color = np.random.rand(B, 3, H, W).astype(np.float32)  # [B, 3, H, W]
+    bbox = np.array([[120, 80, 320, 360], [50, 60, 300, 420]], dtype=np.int32)  # [B, 4]
+    keypoints_3d = np.random.randn(B, 21, 3).astype(np.float32) * 0.05  # [B, 21, 3]
+    keypoints_3d[:, 0, :] = 0.0  # wrist set to 0
+    contact = np.random.rand(B, 21).astype(np.float32)  # [B, 21]
+    is_right = np.array([1, 0], dtype=np.int64)  # [B]
 
-    # ===== 可视化归一化效果 =====
-    print("="*80)
-    print("Visualizing keypoints normalization...")
-    kp_before = kpts_3d if kpts_3d.ndim == 2 else kpts_3d[0]  # [21,3]
-    kp_after = model._normalize_keypoints_xyz(kpts_3d_t).cpu().numpy()[0]  # [21,3]
-    visualize_hand_keypoints(
-        kp_before, kp_after,
-        title="Hand Keypoints Normalization",
-        save_path=args.save_vis
-    )
+    # 转换为 torch tensor
+    color = torch.tensor(color).to(device)  # [B, 3, H, W]
+    bbox = torch.tensor(bbox).to(device)  # [B, 4]
+    keypoints_3d = torch.tensor(keypoints_3d).to(device)  # [B, 21, 3]
+    contact = torch.tensor(contact).to(device)  # [B, 21]
+    is_right = torch.tensor(is_right).to(device)  # [B]
 
-    # ===== 模型推理 =====
-    print("="*80)
-    print("Running model inference...")
     with torch.no_grad():
-        crop_t = model._crop_and_resize(img_rgb_t, bbox_t)  # [1,3,256,256]
-        out = model(crop_t, kpts_3d_t, contact_t, is_right_t)
+        crop = model._crop_and_resize(color, bbox)
+        out = model(crop, keypoints_3d, contact, is_right)
+    print("-"*100)
+    print("pred_triple:", out["pred_triple"])
+    print("logits_base/left/right:", out["logits_base"].shape, out["logits_left"].shape, out["logits_right"].shape)
+    print("S_bl/S_br/S_lr:", out["S_bl"].shape, out["S_br"].shape, out["S_lr"].shape)
 
-    pred_triple = out["pred_triple"].cpu().numpy()[0]  # [3]
-    print(f"Predicted (base, left, right): {pred_triple}")
-    
-    if has_gt:
-        print(f"Ground truth (base, left, right): {gt_blr}")
-        match = np.array_equal(pred_triple, gt_blr)
-        print(f"Match: {match}")
+    color      = np.random.rand(3, H, W).astype(np.float32)            # (3,H,W)
+    bbox       = np.array([120, 80, 320, 360], np.int32)     # (4,)
+    keypoints_3d = np.random.randn(21, 3).astype(np.float32) * 0.05    # (21,3)
+    contact    = np.random.rand(21).astype(np.float32)                 # (21,)
+    is_right   = np.array([1], dtype=np.int64)                         # (1,)
 
-    # 打印各logits的top-3
-    print("-"*80)
-    print("Top-3 predictions for each role:")
-    for role, key in [("Base", "logits_base"), ("Left", "logits_left"), ("Right", "logits_right")]:
-        logits = out[key].cpu().numpy()[0]  # [21]
-        top3_idx = np.argsort(logits)[::-1][:3]
-        top3_scores = logits[top3_idx]
-        print(f"  {role}: {list(zip(top3_idx.tolist(), top3_scores.tolist()))}")
+    # ===== 读入并扩成 batch =====
+    color_t    = model._read_color(color)          # [1,3,H,W]
+    bbox_t     = model._read_bbox(bbox)            # [1,4]
+    kp3d_t     = model._read_keypoints_3d(keypoints_3d)  # [1,21,3]
+    contact_t  = model._read_contact(contact)      # [1,21]
+    isright_t  = model._read_is_right(is_right)    # [1]
 
-    print("-"*80)
-    print(f"img_emb shape: {out['img_emb'].shape}")
-    print(f"node_emb shape: {out['node_emb'].shape}")
-    print("Done.")
+    # ===== 裁剪并前向 =====
+    crop_t     = model._crop_and_resize(color_t, bbox_t)   # [1,3,S,S]
+    out        = model(crop_t.to(device),
+                    kp3d_t.to(device),
+                    contact_t.to(device),
+                    isright_t.to(device))
+    print("-"*100)
+    print("pred_triple:", out["pred_triple"])
+    print("logits_base/left/right:", out["logits_base"].shape, out["logits_left"].shape, out["logits_right"].shape)
+    print("S_bl/S_br/S_lr:", out["S_bl"].shape, out["S_br"].shape, out["S_lr"].shape)
+    print("img_emb:", out["img_emb"].shape)
+    print("node_emb:", out["node_emb"].shape)
