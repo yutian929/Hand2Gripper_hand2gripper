@@ -11,3 +11,5 @@ __pycache__
 
 *.png
 *.jpg
+
+Hand2Gripper_Dataset/
