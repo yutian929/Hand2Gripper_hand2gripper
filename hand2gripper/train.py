@@ -190,7 +190,7 @@ class Hand2GripperDataset(Dataset):
 class LossWeights:
     triple_ce: float = 1.0
     contact_align: float = 0.2
-    dist_upper: float = 0.1  # 仅限制过远，允许闭合/相等
+    dist_upper: float = 0.1  # 仅限制过远，允许闭合
 
 
 def build_comb_logits(out):
@@ -301,11 +301,10 @@ def main(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    # 模型/优化器
+    # 模型/优化器（默认使用DINOv2并冻结参数）
     model = Hand2GripperModel(
         d_model=256, img_size=256, 
-        use_dino=args.use_dino,
-        freeze_backbone=args.freeze_backbone
+        freeze_backbone=not args.no_freeze_backbone
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -460,9 +459,7 @@ if __name__ == "__main__":
     parser.add_argument("--stability_threshold", type=float, default=0.005, help="稳定性阈值")
     parser.add_argument("--resume", type=str, default="", help="从预训练模型继续训练")
     parser.add_argument("--resume_optimizer", action="store_true", help="同时加载优化器状态")
-    # 新增参数
-    parser.add_argument("--use_dino", action="store_true", help="使用DINOv2作为视觉骨干")
-    parser.add_argument("--freeze_backbone", action="store_true", default=True, help="冻结DINOv2参数")
-    parser.add_argument("--no_freeze_backbone", action="store_false", dest="freeze_backbone", help="不冻结DINOv2参数")
+    # DINOv2参数（默认使用DINOv2并冻结）
+    parser.add_argument("--no_freeze_backbone", action="store_true", help="不冻结DINOv2参数（默认冻结）")
     args = parser.parse_args()
     main(args)

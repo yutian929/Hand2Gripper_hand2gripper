@@ -27,9 +27,9 @@ Hand-to-Gripper (2-finger) Mapping Model (Ordered Base/Left/Right)
 3. 将法向量旋转到x轴正方向（掌心朝x正向）
 4. 全局尺度归一化（所有点到原点距离的均值为1）
 
-模型架构改进:
+模型架构:
 - 使用DINOv2预训练骨干提取图像特征（保留空间维度）
-- 使用Cross-Attention让关节点查询图像特征（替代FiLM）
+- 使用Cross-Attention让关节点查询图像特征
 - 使用图注意力网络建模手指骨骼连接结构
 """
 
@@ -97,18 +97,8 @@ class DINOv2Backbone(nn.Module):
         self.freeze_backbone = freeze_backbone
         
         # 加载DINOv2模型
-        try:
-            self.dino = torch.hub.load('facebookresearch/dinov2', model_name)
-            print(f"Loaded DINOv2 model: {model_name}")
-        except Exception as e:
-            print(f"Warning: Failed to load DINOv2 from hub: {e}")
-            print("Falling back to TinyCNN backbone")
-            self.dino = None
-            self.fallback = TinyCNN(out_dim=out_dim)
-            self.use_fallback = True
-            return
-        
-        self.use_fallback = False
+        self.dino = torch.hub.load('facebookresearch/dinov2', model_name)
+        print(f"Loaded DINOv2 model: {model_name}")
         
         # DINOv2特征维度
         if 'vits' in model_name:
@@ -130,7 +120,7 @@ class DINOv2Backbone(nn.Module):
         self.proj_spatial = nn.Conv2d(dino_dim, out_dim, 1)
         
         # 冻结DINOv2参数
-        if freeze_backbone and self.dino is not None:
+        if freeze_backbone:
             for param in self.dino.parameters():
                 param.requires_grad = False
     
@@ -142,14 +132,6 @@ class DINOv2Backbone(nn.Module):
             feat_map: [B, H', W', D] 空间特征图
             feat_global: [B, D] 全局特征
         """
-        if self.use_fallback:
-            feat_global = self.fallback(x)
-            B, D = feat_global.shape
-            # 伪造一个小的feature map
-            feat_map = feat_global.view(B, D, 1, 1).expand(B, D, 4, 4)
-            feat_map = feat_map.permute(0, 2, 3, 1)  # [B, 4, 4, D]
-            return feat_map, feat_global
-        
         B, C, H, W = x.shape
         
         # DINOv2期望224x224或能被14整除的尺寸
@@ -157,7 +139,6 @@ class DINOv2Backbone(nn.Module):
             x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
         
         with torch.set_grad_enabled(not self.freeze_backbone):
-            # 获取patch tokens（不包含CLS token）
             features = self.dino.forward_features(x)
             
             if isinstance(features, dict):
@@ -179,41 +160,6 @@ class DINOv2Backbone(nn.Module):
         feat_global = self.proj(cls_token)  # [B, out_dim]
         
         return feat_map_proj, feat_global
-
-
-# ------------------------------
-# 小型视觉骨干（Fallback）
-# ------------------------------
-class TinyCNN(nn.Module):
-    def __init__(self, out_dim: int = 256):
-        super().__init__()
-        ch = [3, 32, 64, 128, 256]
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(ch[0], ch[1], 3, 2, 1), nn.BatchNorm2d(ch[1]), nn.ReLU(inplace=True),
-            nn.Conv2d(ch[1], ch[1], 3, 1, 1), nn.BatchNorm2d(ch[1]), nn.ReLU(inplace=True),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(ch[1], ch[2], 3, 2, 1), nn.BatchNorm2d(ch[2]), nn.ReLU(inplace=True),
-            nn.Conv2d(ch[2], ch[2], 3, 1, 1), nn.BatchNorm2d(ch[2]), nn.ReLU(inplace=True),
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(ch[2], ch[3], 3, 2, 1), nn.BatchNorm2d(ch[3]), nn.ReLU(inplace=True),
-            nn.Conv2d(ch[3], ch[3], 3, 1, 1), nn.BatchNorm2d(ch[3]), nn.ReLU(inplace=True),
-        )
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(ch[3], ch[4], 3, 2, 1), nn.BatchNorm2d(ch[4]), nn.ReLU(inplace=True),
-            nn.Conv2d(ch[4], ch[4], 3, 1, 1), nn.BatchNorm2d(ch[4]), nn.ReLU(inplace=True),
-        )
-        self.proj = nn.Linear(ch[4], out_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv1(x)   # B,32,128,128
-        x = self.conv2(x)   # B,64,64,64
-        x = self.conv3(x)   # B,128,32,32
-        x = self.conv4(x)   # B,256,16,16
-        x = F.adaptive_avg_pool2d(x, 1).flatten(1)  # B,256
-        x = self.proj(x)    # B,D
-        return x
 
 
 # ------------------------------
@@ -366,9 +312,9 @@ class CrossAttention(nn.Module):
 # ------------------------------
 # 节点特征编码 + Graph Attention + Cross-Attention
 # ------------------------------
-class HandNodeEncoderV2(nn.Module):
+class HandNodeEncoder(nn.Module):
     """
-    改进的节点编码器：
+    节点编码器：
     1. MLP编码节点特征
     2. Graph Attention建模骨骼结构
     3. Cross-Attention融合图像特征
@@ -515,23 +461,18 @@ class Hand2GripperModel(nn.Module):
     - 图注意力建模手指骨骼结构
     """
     def __init__(self, d_model: int = 256, img_size: int = 256,
-                 backbone: str = "dinov2_vits14", freeze_backbone: bool = True,
-                 use_dino: bool = True):
+                 backbone: str = "dinov2_vits14", freeze_backbone: bool = True):
         super().__init__()
         self.img_size = img_size
         self.crop_scale = 1.2
-        self.use_dino = use_dino
         
-        # 视觉骨干
-        if use_dino:
-            self.backbone = DINOv2Backbone(
-                model_name=backbone, out_dim=d_model, freeze_backbone=freeze_backbone
-            )
-        else:
-            self.backbone = TinyCNN(out_dim=d_model)
+        # DINOv2视觉骨干
+        self.backbone = DINOv2Backbone(
+            model_name=backbone, out_dim=d_model, freeze_backbone=freeze_backbone
+        )
         
         # 节点编码器（改进版）
-        self.encoder = HandNodeEncoderV2(
+        self.encoder = HandNodeEncoder(
             in_dim=26, hidden=d_model, out_dim=d_model,
             num_gat_layers=2, num_cross_attn_layers=2,
             num_transformer_layers=2, num_heads=8, dropout=0.1
@@ -769,13 +710,7 @@ class Hand2GripperModel(nn.Module):
                 contact: torch.Tensor, is_right: torch.Tensor) -> Dict[str, torch.Tensor]:
         
         # 提取图像特征
-        if self.use_dino:
-            img_feat_map, img_emb = self.backbone(img_crop)  # [B,H',W',D], [B,D]
-        else:
-            img_emb = self.backbone(img_crop)  # [B,D]
-            B, D = img_emb.shape
-            # 伪造feature map用于cross-attention
-            img_feat_map = img_emb.view(B, 1, 1, D).expand(B, 4, 4, D)
+        img_feat_map, img_emb = self.backbone(img_crop)  # [B,H',W',D], [B,D]
 
         # 关键点归一化与节点特征构建
         kp_xyz_norm = self._normalize_keypoints_xyz(keypoints_3d)
@@ -816,14 +751,10 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
         save_path: 保存路径，None则显示
     """
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
     
     finger_links = [
-        [0, 1, 2, 3, 4],
-        [0, 5, 6, 7, 8],
-        [0, 9, 10, 11, 12],
-        [0, 13, 14, 15, 16],
-        [0, 17, 18, 19, 20],
+        [0, 1, 2, 3, 4], [0, 5, 6, 7, 8], [0, 9, 10, 11, 12],
+        [0, 13, 14, 15, 16], [0, 17, 18, 19, 20],
     ]
     finger_colors = ['red', 'orange', 'green', 'blue', 'purple']
     
@@ -840,9 +771,7 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
     palm_pts = kp_before[palm_idx]
     ax1.scatter(palm_pts[:, 0], palm_pts[:, 1], palm_pts[:, 2], 
                 color='cyan', s=60, marker='s', label='Palm plane')
-    ax1.set_xlabel('X')
-    ax1.set_ylabel('Y')
-    ax1.set_zlabel('Z')
+    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
     ax1.legend()
     _set_axes_equal(ax1)
     
@@ -860,9 +789,7 @@ def visualize_hand_keypoints(kp_before: np.ndarray, kp_after: np.ndarray,
     ax2.quiver(0, 0, 0, 0, 0.5, 0, color='g', arrow_length_ratio=0.1, linewidth=2)
     ax2.quiver(0, 0, 0, 0, 0, 0.5, color='b', arrow_length_ratio=0.1, linewidth=2)
     ax2.text(0.55, 0, 0, '+X (palm normal)', fontsize=8)
-    ax2.set_xlabel('X')
-    ax2.set_ylabel('Y')
-    ax2.set_zlabel('Z')
+    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
     ax2.legend()
     _set_axes_equal(ax2)
     
@@ -901,16 +828,17 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="", help="Path to model checkpoint")
     parser.add_argument("--save_vis", type=str, default=None, help="Path to save visualization")
     parser.add_argument("--use_random", action="store_true", help="Use random data instead of npz file")
-    parser.add_argument("--use_dino", action="store_true", help="Use DINOv2 backbone")
+    parser.add_argument("--no_freeze_backbone", action="store_true", help="不冻结DINOv2参数")
     args = parser.parse_args()
     
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # 初始化模型
+    # 初始化模型（默认使用DINOv2并冻结参数）
     model = Hand2GripperModel(
-        d_model=256, img_size=256, use_dino=args.use_dino
+        d_model=256, img_size=256, 
+        freeze_backbone=not args.no_freeze_backbone
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
