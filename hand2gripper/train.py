@@ -28,7 +28,8 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-from models.simple import Hand2GripperModel
+# from models.simple import Hand2GripperModel
+from models.simple_del_hoi import Hand2GripperModel
 
 
 # ------------------------------
