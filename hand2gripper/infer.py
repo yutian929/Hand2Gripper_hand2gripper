@@ -7,7 +7,7 @@ Hand-to-Gripper 模型推理脚本。
 - 加载一个训练好的 Hand2GripperModel。
 - 读取一个 .npz 格式的样本数据。
 - 执行完整的预处理、模型推理和后处理。
-- 打印预测结果并可选地生成可视化图像。
+- 打印预测结果 (left, right) 并可选地生成可视化图像。
 
 用法示例:
   # 对 sample.npz 进行推理，并保存可视化结果到 output.png
@@ -24,27 +24,31 @@ import cv2
 from typing import Dict
 
 # 假设此脚本与 models 目录在同一级别
-from models.simple import Hand2GripperModel
+from models.simple_pair import Hand2GripperModel
 
 # ------------------------------
-# 可视化工具函数 (从 phantom.utils.hand2gripper_visualize.py 简化而来)
+# 可视化工具函数
 # ------------------------------
-def vis_selected_gripper(image: np.ndarray, kpts_2d: np.ndarray, gripper_joints_seq: np.ndarray) -> np.ndarray:
-    """在图像上绘制选定的抓手关节点和连线。"""
+def vis_selected_gripper(image: np.ndarray, kpts_2d: np.ndarray, gripper_joints_pair: np.ndarray) -> np.ndarray:
+    """
+    在图像上绘制选定的夹爪关节点和连线。
+    
+    Args:
+        image: 原始图像 [H, W, 3]
+        kpts_2d: 2D关键点 [21, 2]
+        gripper_joints_pair: 预测的 (left, right) 索引 [2]
+    """
     img_vis = image.copy()
-    colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0)]  # Base: Green, Left: Blue, Right: Red
-    labels = ["B", "L", "R"]
+    colors = [(0, 0, 255), (255, 0, 0)]  # Left: Blue, Right: Red
+    labels = ["L", "R"]
     
-    # 绘制连线
-    base_pt = tuple(kpts_2d[gripper_joints_seq[0]].astype(int))
-    left_pt = tuple(kpts_2d[gripper_joints_seq[1]].astype(int))
-    right_pt = tuple(kpts_2d[gripper_joints_seq[2]].astype(int))
-    
-    cv2.line(img_vis, base_pt, left_pt, (255, 255, 0), 2)  # Cyan
-    cv2.line(img_vis, base_pt, right_pt, (255, 0, 255), 2) # Magenta
+    # 绘制连线 (left -> right)
+    left_pt = tuple(kpts_2d[gripper_joints_pair[0]].astype(int))
+    right_pt = tuple(kpts_2d[gripper_joints_pair[1]].astype(int))
+    cv2.line(img_vis, left_pt, right_pt, (255, 255, 0), 2)  # Cyan
 
     # 绘制关节点
-    for i, joint_id in enumerate(gripper_joints_seq):
+    for i, joint_id in enumerate(gripper_joints_pair):
         pt = tuple(kpts_2d[joint_id].astype(int))
         cv2.circle(img_vis, pt, 5, colors[i], -1)
         cv2.putText(img_vis, labels[i], (pt[0] + 5, pt[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors[i], 2)
@@ -118,7 +122,7 @@ class Hand2GripperInference:
             is_right (np.ndarray): 是否为右手, 标量或 [1]
 
         Returns:
-            Dict[str, torch.Tensor]: 模型的原始输出字典。
+            np.ndarray: 预测的 (left, right) 关键点索引 [2]
         """
         # 1. 使用模型内部的读取函数将 numpy 数组转换为 batched tensor
         color_t = self.model._read_color(color).to(self.device)
@@ -134,21 +138,21 @@ class Hand2GripperInference:
         # 3. 模型前向传播
         outputs = self.model(crop_t, kp3d_t, contact_t, isright_t)
         
-        return outputs['pred_triple'].squeeze().cpu().numpy()
+        return outputs['pred_pair'].squeeze().cpu().numpy()
     
-    def vis_output(self, image: np.ndarray, kpts_2d: np.ndarray, pred_triple: np.array) -> np.ndarray:
+    def vis_output(self, image: np.ndarray, kpts_2d: np.ndarray, pred_pair: np.array) -> np.ndarray:
         """
         可视化模型输出结果。
 
         Args:
             image (np.ndarray): 原始图像, [H,W,3], uint8
             kpts_2d (np.ndarray): 2D关节点, [21,2]
-            pred_triple (np.ndarray): 预测的抓手关节点索引, [3]
+            pred_pair (np.ndarray): 预测的夹爪关节点索引 (left, right), [2]
 
         Returns:
             np.ndarray: 带有可视化结果的图像。
         """
-        vis_img = vis_selected_gripper(image, kpts_2d, pred_triple)
+        vis_img = vis_selected_gripper(image, kpts_2d, pred_pair)
         return vis_img
 
 # ------------------------------
@@ -194,14 +198,13 @@ def main(args):
     )
 
     # 后处理和打印结果
-    pred_triple = outputs
+    pred_pair = outputs
     print("\n" + "="*30)
     print("      Inference Result")
     print("="*30)
-    print(f"Predicted Gripper Triple (Base, Left, Right): {pred_triple}")
-    print(f"  - Base Joint ID:  {pred_triple[0]}")
-    print(f"  - Left Joint ID:  {pred_triple[1]}")
-    print(f"  - Right Joint ID: {pred_triple[2]}")
+    print(f"Predicted Gripper Pair (Left, Right): {pred_pair}")
+    print(f"  - Left Joint ID:  {pred_pair[0]}")
+    print(f"  - Right Joint ID: {pred_pair[1]}")
     print("="*30)
 
     # 可视化
@@ -220,7 +223,7 @@ def main(args):
         vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
 
         # 绘制结果
-        vis_img_result = inference_engine.vis_output(vis_img, kpts_2d_np, pred_triple)
+        vis_img_result = inference_engine.vis_output(vis_img, kpts_2d_np, pred_pair)
         
         # 保存图像
         try:

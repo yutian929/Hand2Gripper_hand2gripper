@@ -1,20 +1,17 @@
 # train.py
 # -*- coding: utf-8 -*-
 """
-三元输出 (base, left, right) 的训练脚本。
-- 支持两种数据源：
-  1) 真实数据: Hand2GripperDataset(需 processor_config.DataManager)
-  2) 玩具数据: ToyTripleDataset (--use_toy 开关)
-- 模型: from models.model import Hand2GripperModel  (你的三元输出版 model.py)
+二元输出 (left, right) 的训练脚本。
+- 数据集的真值仍为3个 (base, left, right)，但训练时只使用 left/right
+- 模型: from models.simple_pair import Hand2GripperModel
 - 损失:
-  * 三个有序CE (base/left/right)
-  * 三元联合分类 (基于联合打分 comb 的 21^3 类)
+  * 两个有序CE (left/right)
+  * 二元联合分类 (基于联合打分 comb 的 21^2 类)
   * 接触一致 (soft-target)
   * 距离上界先验 (限制过远，允许闭合)
 
 用法示例：
   python train.py --dataset_root /path/to/raw --epochs 10 --batch_size 64
-  python train.py --use_toy --epochs 3
 """
 import os
 import random
@@ -28,8 +25,8 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-# from models.simple import Hand2GripperModel
-from models.simple_del_hoi import Hand2GripperModel
+from models.simple_pair import Hand2GripperModel
+# from models.simple_pair_del_hoi import Hand2GripperModel
 
 
 # ------------------------------
@@ -189,36 +186,42 @@ class Hand2GripperDataset(Dataset):
 # ------------------------------
 @dataclass
 class LossWeights:
-    triple_ce: float = 1.0
-    contact_align: float = 0.2
-    dist_upper: float = 0.1  # 仅限制过远，允许闭合
+    """Loss 权重配置"""
+    pair_ce: float = 1.0           # 二元联合分类损失权重
+    contact_align: float = 0.2     # 接触对齐损失权重
+    dist_upper: float = 0.1        # 距离上界先验损失权重（仅限制过远，允许闭合）
 
 
 def build_comb_logits(out):
-    """按模型三元联合打分构造 comb: [B,21,21,21]"""
-    lb = out["logits_base"]
-    ll = out["logits_left"]
-    lr = out["logits_right"]
-    S_bl = out["S_bl"]
-    S_br = out["S_br"]
-    S_lr = out["S_lr"]
+    """
+    构造二元联合打分 comb: [B, 21, 21]
+    comb[i,j] = logits_left[i] + logits_right[j] + S_lr[i,j]
+    """
+    ll = out["logits_left"]   # [B, 21]
+    lr = out["logits_right"]  # [B, 21]
+    S_lr = out["S_lr"]        # [B, 21, 21]
     comb = (
-        lb[:, :, None, None] +
-        ll[:, None, :, None] +
-        lr[:, None, None, :] +
-        S_bl[:, :, :, None] +
-        S_br[:, :, None, :] +
-        S_lr[:, None, :, :]
+        ll[:, :, None] +      # [B, 21, 1]
+        lr[:, None, :] +      # [B, 1, 21]
+        S_lr                  # [B, 21, 21]
     )
-    return comb
+    return comb  # [B, 21, 21]
 
 
-def contact_align_loss_three(prob_base, prob_left, prob_right, contact, eps=1e-6):
-    """把三路概率平均后与 contact 对齐（soft-target CE）。"""
+def contact_align_loss_two(prob_left, prob_right, contact, eps=1e-6):
+    """
+    把两路概率平均后与 contact 对齐（soft-target CE）。
+    
+    Args:
+        prob_left:  [B, 21] 左指尖概率分布
+        prob_right: [B, 21] 右指尖概率分布
+        contact:    [B, 21] 接触概率
+        eps:        防止log(0)的小常数
+    """
     tgt = contact.clamp(min=0.0)
     s = tgt.sum(dim=1, keepdim=True)
     tgt = torch.where(s > 0, tgt / (s + eps), torch.full_like(tgt, 1.0 / tgt.shape[1]))
-    avg_prob = (prob_base + prob_left + prob_right) / 3.0
+    avg_prob = (prob_left + prob_right) / 2.0
     loss = -(tgt * (avg_prob + eps).log()).sum(dim=1).mean()
     return loss
 
@@ -230,55 +233,69 @@ def distance_upper_prior(prob_left, prob_right, kp_xyz_norm, d_max=3.5):
     return F.relu(E - d_max).mean()
 
 
-def compute_losses(out, gt_base, gt_left, gt_right, kp_xyz_norm, contact, lw: LossWeights):
-    # 三个有序CE
-    ce_base = F.cross_entropy(out["logits_base"], gt_base)
+def compute_losses(out, gt_left, gt_right, kp_xyz_norm, contact, lw: LossWeights):
+    """
+    计算训练损失
+    
+    Args:
+        out: 模型输出字典
+        gt_left:  [B] left 真值索引
+        gt_right: [B] right 真值索引
+        kp_xyz_norm: [B, 21, 3] 归一化后的关键点
+        contact: [B, 21] 接触概率
+        lw: 损失权重配置
+    """
+    # 两个有序 CE
     ce_left = F.cross_entropy(out["logits_left"], gt_left)
     ce_right = F.cross_entropy(out["logits_right"], gt_right)
 
-    # 三元联合分类: 21^3 类
-    comb = build_comb_logits(out)                    # [B,21,21,21]
-    B, N, _, _ = comb.shape
-    comb_flat = comb.view(B, -1)                     # [B, 9261]
-    idx_pos = gt_base * (N * N) + gt_left * N + gt_right
-    ce_triple = F.cross_entropy(comb_flat, idx_pos)
+    # 二元联合分类: 21^2 类
+    comb = build_comb_logits(out)                    # [B, 21, 21]
+    B, N, _ = comb.shape
+    comb_flat = comb.view(B, -1)                     # [B, 441]
+    idx_pos = gt_left * N + gt_right                 # [B]
+    ce_pair = F.cross_entropy(comb_flat, idx_pos)
 
     # 接触一致
-    pb = F.softmax(out["logits_base"], dim=-1)
     pl = F.softmax(out["logits_left"], dim=-1)
     pr = F.softmax(out["logits_right"], dim=-1)
-    contact_loss = contact_align_loss_three(pb, pl, pr, contact)
+    contact_loss = contact_align_loss_two(pl, pr, contact)
 
     # 距离上界先验（仅限制过远）
     dist_loss = distance_upper_prior(pl, pr, kp_xyz_norm)
 
-    loss = (ce_base + ce_left + ce_right) + lw.triple_ce * ce_triple \
+    loss = (ce_left + ce_right) + lw.pair_ce * ce_pair \
            + lw.contact_align * contact_loss + lw.dist_upper * dist_loss
 
     return loss, {
         "loss": loss.item(),
-        "ce_base": ce_base.item(),
         "ce_left": ce_left.item(),
         "ce_right": ce_right.item(),
-        "ce_triple": ce_triple.item(),
+        "ce_pair": ce_pair.item(),
         "contact": contact_loss.item(),
         "dist_upper": dist_loss.item(),
     }
 
 
 @torch.no_grad()
-def eval_metrics(out, gt_base, gt_left, gt_right):
-    """有序 Top-1 与三元联合准确率。"""
-    pb = out["logits_base"].argmax(dim=-1)
-    pl = out["logits_left"].argmax(dim=-1)
-    pr = out["logits_right"].argmax(dim=-1)
-    triple = out["pred_triple"]  # [B,3]
+def eval_metrics(out, gt_left, gt_right):
+    """
+    计算验证指标：left/right 单独准确率和二元联合准确率
+    
+    Args:
+        out: 模型输出字典
+        gt_left:  [B] left 真值索引
+        gt_right: [B] right 真值索引
+    """
+    pl = out["logits_left"].argmax(dim=-1)   # [B]
+    pr = out["logits_right"].argmax(dim=-1)  # [B]
+    pred_pair = out["pred_pair"]             # [B, 2]
 
-    base_acc = (pb == gt_base).float().mean().item()
     left_acc = (pl == gt_left).float().mean().item()
     right_acc = (pr == gt_right).float().mean().item()
-    triple_acc = ((triple[:, 0] == gt_base) & (triple[:, 1] == gt_left) & (triple[:, 2] == gt_right)).float().mean().item()
-    return {"base_acc": base_acc, "left_acc": left_acc, "right_acc": right_acc, "triple_acc": triple_acc}
+    pair_acc = ((pred_pair[:, 0] == gt_left) & (pred_pair[:, 1] == gt_right)).float().mean().item()
+    
+    return {"left_acc": left_acc, "right_acc": right_acc, "pair_acc": pair_acc}
 
 
 # ------------------------------
@@ -338,7 +355,7 @@ def main(args):
     early_stopping = EarlyStopping(
         patience=args.patience, 
         min_delta=0.001, 
-        metric='triple_acc'
+        metric='pair_acc'  # 改为 pair_acc
     )
 
     best_val = -1.0
@@ -353,7 +370,7 @@ def main(args):
             print(f"Reached specified epochs: {args.epochs}")
             break
         model.train()
-        meter = {k: 0.0 for k in ["loss", "ce_base", "ce_left", "ce_right", "ce_triple", "contact", "dist_upper"]}
+        meter = {k: 0.0 for k in ["loss", "ce_left", "ce_right", "ce_pair", "contact", "dist_upper"]}
         for step, batch in enumerate(train_loader, 1):
             img_rgb_t = batch["img_rgb_t"].to(device)
             bbox_t = batch["bbox_t"].to(device).float()
@@ -361,8 +378,8 @@ def main(args):
             contact_logits_t = batch["contact_logits_t"].to(device)
             is_right_t = batch["is_right_t"].to(device)
             
+            # 数据集仍然返回 BLR 三元组，只用 L/R
             selected_gripper_blr_ids_t = batch["selected_gripper_blr_ids_t"].to(device)
-            gt_base_t = selected_gripper_blr_ids_t[:, 0].view(-1)
             gt_left_t = selected_gripper_blr_ids_t[:, 1].view(-1)
             gt_right_t = selected_gripper_blr_ids_t[:, 2].view(-1)
 
@@ -375,7 +392,7 @@ def main(args):
                 scale = kp.norm(dim=-1).mean(dim=1, keepdim=True).clamp(min=1e-6)
                 kp_norm = kp / scale.unsqueeze(-1)
 
-                loss, loss_items = compute_losses(out, gt_base_t, gt_left_t, gt_right_t, kp_norm, contact_logits_t, lw)
+                loss, loss_items = compute_losses(out, gt_left_t, gt_right_t, kp_norm, contact_logits_t, lw)
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -390,7 +407,7 @@ def main(args):
 
         # 验证
         model.eval()
-        eval_meter = {"base_acc": 0.0, "left_acc": 0.0, "right_acc": 0.0, "triple_acc": 0.0}
+        eval_meter = {"left_acc": 0.0, "right_acc": 0.0, "pair_acc": 0.0}
         with torch.no_grad():
             for batch in val_loader:
                 img_rgb_t = batch["img_rgb_t"].to(device)
@@ -399,14 +416,14 @@ def main(args):
                 contact_logits_t = batch["contact_logits_t"].to(device)
                 is_right_t = batch["is_right_t"].to(device)
                 
+                # 数据集仍然返回 BLR 三元组，只用 L/R
                 selected_gripper_blr_ids_t = batch["selected_gripper_blr_ids_t"].to(device)
-                gt_base_t = selected_gripper_blr_ids_t[:, 0].view(-1)
                 gt_left_t = selected_gripper_blr_ids_t[:, 1].view(-1)
                 gt_right_t = selected_gripper_blr_ids_t[:, 2].view(-1)
 
                 preprocessed_crop_img_rgb = model._crop_and_resize(img_rgb_t, bbox_t)
                 out = model.forward(preprocessed_crop_img_rgb, kpts_3d_t, contact_logits_t, is_right_t.view(-1))
-                m = eval_metrics(out, gt_base_t, gt_left_t, gt_right_t)
+                m = eval_metrics(out, gt_left_t, gt_right_t)
                 for k in eval_meter:
                     eval_meter[k] += m[k]
 
@@ -415,24 +432,24 @@ def main(args):
 
         print(f"[Epoch {ep}] "
               f"loss={train_log['loss']:.4f} "
-              f"CE(B/L/R/T)={train_log['ce_base']:.3f}/{train_log['ce_left']:.3f}/{train_log['ce_right']:.3f}/{train_log['ce_triple']:.3f} "
+              f"CE(L/R/Pair)={train_log['ce_left']:.3f}/{train_log['ce_right']:.3f}/{train_log['ce_pair']:.3f} "
               f"contact={train_log['contact']:.3f} dist_upper={train_log['dist_upper']:.3f} | "
-              f"val_acc(B/L/R/T)={eval_log['base_acc']:.3f}/{eval_log['left_acc']:.3f}/{eval_log['right_acc']:.3f}/{eval_log['triple_acc']:.3f}")
+              f"val_acc(L/R/Pair)={eval_log['left_acc']:.3f}/{eval_log['right_acc']:.3f}/{eval_log['pair_acc']:.3f}")
 
-        # 保存最好（三元联合准确率）
-        if eval_log["triple_acc"] > best_val:
-            best_val = eval_log["triple_acc"]
+        # 保存最好（二元联合准确率）
+        if eval_log["pair_acc"] > best_val:
+            best_val = eval_log["pair_acc"]
             torch.save(model.state_dict(), args.save)
             # 如果启用了优化器状态保存，同时保存优化器状态
             if args.resume_optimizer:
                 optimizer_save_path = args.save.replace('.pt', '_optimizer.pt')
                 torch.save(opt.state_dict(), optimizer_save_path)
-                print(f"  >> Saved best to {args.save} and optimizer to {optimizer_save_path} (triple_acc={best_val:.3f})")
+                print(f"  >> Saved best to {args.save} and optimizer to {optimizer_save_path} (pair_acc={best_val:.3f})")
             else:
-                print(f"  >> Saved best to {args.save} (triple_acc={best_val:.3f})")
+                print(f"  >> Saved best to {args.save} (pair_acc={best_val:.3f})")
 
         # 早停检查
-        if early_stopping(eval_log["triple_acc"]):
+        if early_stopping(eval_log["pair_acc"]):
             print(f"Early stopping at epoch {ep} (patience={args.patience})")
             break
             
