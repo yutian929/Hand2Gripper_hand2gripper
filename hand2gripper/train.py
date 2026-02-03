@@ -25,8 +25,8 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-from models.simple_pair import Hand2GripperModel
-# from models.simple_pair_del_hoi import Hand2GripperModel
+# from models.simple_pair import Hand2GripperModel
+from hand2gripper.models.simple_pair_del_hoi import Hand2GripperModel
 
 
 # ------------------------------
@@ -308,18 +308,26 @@ def main(args):
     print(f"Device: {device}")
 
     # 数据
-    full_ds = Hand2GripperDataset(args.dataset_root)
-    total = len(full_ds)
-    tsize = int(total * args.train_ratio)
-    vsize = total - tsize
-    train_ds, val_ds = random_split(full_ds, [tsize, vsize])
+    train_dir = os.path.join(args.dataset_root, 'train')
+    val_dir = os.path.join(args.dataset_root, 'val')
+    test_dir = os.path.join(args.dataset_root, 'test')
+
+    print(f"Loading training data from {train_dir}")
+    train_ds = Hand2GripperDataset(train_dir)
+    print(f"Loading validation data from {val_dir}")
+    val_ds = Hand2GripperDataset(val_dir)
+    print(f"Loading test data from {test_dir}")
+    test_ds = Hand2GripperDataset(test_dir)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
 
     # 模型/优化器（默认使用DINOv2并冻结参数）
+
     model = Hand2GripperModel(
         d_model=256, img_size=256, 
         freeze_backbone=not args.no_freeze_backbone
@@ -458,6 +466,32 @@ def main(args):
             if early_stopping.is_stable(args.stability_window, args.stability_threshold):
                 print(f"Training converged at epoch {ep} (accuracy stabilized)")
                 break
+
+    # 测试
+    print("\nStarting evaluation on test set...")
+    model.eval()
+    test_meter = {"left_acc": 0.0, "right_acc": 0.0, "pair_acc": 0.0}
+    with torch.no_grad():
+        for batch in test_loader:
+            img_rgb_t = batch["img_rgb_t"].to(device)
+            bbox_t = batch["bbox_t"].to(device).float()
+            kpts_3d_t = batch["kpts_3d_t"].to(device)
+            contact_logits_t = batch["contact_logits_t"].to(device)
+            is_right_t = batch["is_right_t"].to(device)
+            
+            selected_gripper_blr_ids_t = batch["selected_gripper_blr_ids_t"].to(device)
+            gt_left_t = selected_gripper_blr_ids_t[:, 1].view(-1)
+            gt_right_t = selected_gripper_blr_ids_t[:, 2].view(-1)
+
+            preprocessed_crop_img_rgb = model._crop_and_resize(img_rgb_t, bbox_t)
+            out = model.forward(preprocessed_crop_img_rgb, kpts_3d_t, contact_logits_t, is_right_t.view(-1))
+            m = eval_metrics(out, gt_left_t, gt_right_t)
+            for k in test_meter:
+                test_meter[k] += m[k]
+
+    n_test = len(test_loader)
+    test_log = {k: v / n_test for k, v in test_meter.items()}
+    print(f"Test Set Results: L/R/Pair Acc = {test_log['left_acc']:.3f}/{test_log['right_acc']:.3f}/{test_log['pair_acc']:.3f}")
 
     print("Done.")
 
