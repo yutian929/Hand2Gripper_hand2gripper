@@ -25,8 +25,8 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import Dataset, DataLoader, random_split
 
-# from models.simple_pair import Hand2GripperModel
-from hand2gripper.models.simple_pair_del_hoi import Hand2GripperModel
+from models.simple_pair import Hand2GripperModel
+# from hand2gripper.models.simple_pair_del_hoi import Hand2GripperModel
 
 
 # ------------------------------
@@ -188,8 +188,6 @@ class Hand2GripperDataset(Dataset):
 class LossWeights:
     """Loss 权重配置"""
     pair_ce: float = 1.0           # 二元联合分类损失权重
-    contact_align: float = 0.2     # 接触对齐损失权重
-    dist_upper: float = 0.1        # 距离上界先验损失权重（仅限制过远，允许闭合）
 
 
 def build_comb_logits(out):
@@ -208,32 +206,7 @@ def build_comb_logits(out):
     return comb  # [B, 21, 21]
 
 
-def contact_align_loss_two(prob_left, prob_right, contact, eps=1e-6):
-    """
-    把两路概率平均后与 contact 对齐（soft-target CE）。
-    
-    Args:
-        prob_left:  [B, 21] 左指尖概率分布
-        prob_right: [B, 21] 右指尖概率分布
-        contact:    [B, 21] 接触概率
-        eps:        防止log(0)的小常数
-    """
-    tgt = contact.clamp(min=0.0)
-    s = tgt.sum(dim=1, keepdim=True)
-    tgt = torch.where(s > 0, tgt / (s + eps), torch.full_like(tgt, 1.0 / tgt.shape[1]))
-    avg_prob = (prob_left + prob_right) / 2.0
-    loss = -(tgt * (avg_prob + eps).log()).sum(dim=1).mean()
-    return loss
-
-
-def distance_upper_prior(prob_left, prob_right, kp_xyz_norm, d_max=3.5):
-    """只限制过远抓取（允许闭合/相等）。"""
-    dist = torch.cdist(kp_xyz_norm, kp_xyz_norm, p=2)  # [B,21,21]
-    E = (prob_left.unsqueeze(2) * prob_right.unsqueeze(1) * dist).sum(dim=(1, 2))  # [B]
-    return F.relu(E - d_max).mean()
-
-
-def compute_losses(out, gt_left, gt_right, kp_xyz_norm, contact, lw: LossWeights):
+def compute_losses(out, gt_left, gt_right, lw: LossWeights):
     """
     计算训练损失
     
@@ -241,8 +214,6 @@ def compute_losses(out, gt_left, gt_right, kp_xyz_norm, contact, lw: LossWeights
         out: 模型输出字典
         gt_left:  [B] left 真值索引
         gt_right: [B] right 真值索引
-        kp_xyz_norm: [B, 21, 3] 归一化后的关键点
-        contact: [B, 21] 接触概率
         lw: 损失权重配置
     """
     # 两个有序 CE
@@ -256,24 +227,13 @@ def compute_losses(out, gt_left, gt_right, kp_xyz_norm, contact, lw: LossWeights
     idx_pos = gt_left * N + gt_right                 # [B]
     ce_pair = F.cross_entropy(comb_flat, idx_pos)
 
-    # 接触一致
-    pl = F.softmax(out["logits_left"], dim=-1)
-    pr = F.softmax(out["logits_right"], dim=-1)
-    contact_loss = contact_align_loss_two(pl, pr, contact)
-
-    # 距离上界先验（仅限制过远）
-    dist_loss = distance_upper_prior(pl, pr, kp_xyz_norm)
-
-    loss = (ce_left + ce_right) + lw.pair_ce * ce_pair \
-           + lw.contact_align * contact_loss + lw.dist_upper * dist_loss
+    loss = (ce_left + ce_right) + lw.pair_ce * ce_pair
 
     return loss, {
         "loss": loss.item(),
         "ce_left": ce_left.item(),
         "ce_right": ce_right.item(),
         "ce_pair": ce_pair.item(),
-        "contact": contact_loss.item(),
-        "dist_upper": dist_loss.item(),
     }
 
 
@@ -378,7 +338,7 @@ def main(args):
             print(f"Reached specified epochs: {args.epochs}")
             break
         model.train()
-        meter = {k: 0.0 for k in ["loss", "ce_left", "ce_right", "ce_pair", "contact", "dist_upper"]}
+        meter = {k: 0.0 for k in ["loss", "ce_left", "ce_right", "ce_pair"]}
         for step, batch in enumerate(train_loader, 1):
             img_rgb_t = batch["img_rgb_t"].to(device)
             bbox_t = batch["bbox_t"].to(device).float()
@@ -394,13 +354,8 @@ def main(args):
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
                 preprocessed_crop_img_rgb = model._crop_and_resize(img_rgb_t, bbox_t)
                 out = model.forward(preprocessed_crop_img_rgb, kpts_3d_t, contact_logits_t, is_right_t.view(-1))
-                kp = kpts_3d_t.clone()
-                wrist = kp[:, 0:1, :]
-                kp = kp - wrist
-                scale = kp.norm(dim=-1).mean(dim=1, keepdim=True).clamp(min=1e-6)
-                kp_norm = kp / scale.unsqueeze(-1)
 
-                loss, loss_items = compute_losses(out, gt_left_t, gt_right_t, kp_norm, contact_logits_t, lw)
+                loss, loss_items = compute_losses(out, gt_left_t, gt_right_t, lw)
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -440,8 +395,7 @@ def main(args):
 
         print(f"[Epoch {ep}] "
               f"loss={train_log['loss']:.4f} "
-              f"CE(L/R/Pair)={train_log['ce_left']:.3f}/{train_log['ce_right']:.3f}/{train_log['ce_pair']:.3f} "
-              f"contact={train_log['contact']:.3f} dist_upper={train_log['dist_upper']:.3f} | "
+              f"CE(L/R/Pair)={train_log['ce_left']:.3f}/{train_log['ce_right']:.3f}/{train_log['ce_pair']:.3f} | "
               f"val_acc(L/R/Pair)={eval_log['left_acc']:.3f}/{eval_log['right_acc']:.3f}/{eval_log['pair_acc']:.3f}")
 
         # 保存最好（二元联合准确率）
@@ -505,7 +459,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
     parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--save", type=str, default="hand2gripper.pt", help="模型保存路径")
+    parser.add_argument("--save", type=str, default="simple_pair.pt", help="模型保存路径")
     parser.add_argument("--patience", type=int, default=15, help="早停耐心值")
     parser.add_argument("--stability_window", type=int, default=10, help="稳定性检测窗口大小")
     parser.add_argument("--stability_threshold", type=float, default=0.005, help="稳定性阈值")
