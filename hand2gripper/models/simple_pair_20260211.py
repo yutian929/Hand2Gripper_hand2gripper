@@ -323,33 +323,30 @@ class HandNodeEncoder(nn.Module):
                  num_gat_layers: int = 2, num_cross_attn_layers: int = 2,
                  num_transformer_layers: int = 2, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-        
-        # 1. 节点特征MLP
-        self.node_mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, out_dim),
-        )
-        
+        # 门控机制：对contact特征做门控融合
+        self.gate_linear = nn.Linear(1, out_dim)
+        self.feat_linear = nn.Linear(in_dim - 1, out_dim)
+        self.gate_sigmoid = nn.Sigmoid()
+
         # 2. 图注意力层（建模骨骼连接）
         self.gat_layers = nn.ModuleList([
             MultiHeadGraphAttention(out_dim, out_dim, num_heads=4, dropout=dropout)
             for _ in range(num_gat_layers)
         ])
-        
+
         # 3. Cross-Attention层（融合图像特征）
         self.cross_attn_layers = nn.ModuleList([
             CrossAttention(d_model=out_dim, num_heads=num_heads, dropout=dropout)
             for _ in range(num_cross_attn_layers)
         ])
-        
+
         # 4. Transformer自注意力层
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=out_dim, nhead=num_heads, dim_feedforward=out_dim * 2,
             batch_first=True, dropout=dropout, activation="gelu"
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
-        
+
         # 预计算邻接矩阵（注册为buffer）
         adj = build_hand_adjacency_matrix(21, HAND_EDGES, self_loop=True)
         self.register_buffer('adj', adj)
@@ -365,9 +362,14 @@ class HandNodeEncoder(nn.Module):
             H: [B, 21, out_dim]
         """
         B = node_feats.shape[0]
-        
-        # 1. MLP编码
-        H = self.node_mlp(node_feats)  # [B, 21, D]
+        # 拆分contact和其他特征
+        contact = node_feats[..., 3:4]  # [B, 21, 1]
+        other_feats = torch.cat([node_feats[..., :3], node_feats[..., 4:]], dim=-1)  # [B, 21, in_dim-1]
+
+        # 门控融合
+        gate = self.gate_sigmoid(self.gate_linear(contact))  # [B, 21, out_dim]
+        feat_proj = self.feat_linear(other_feats)            # [B, 21, out_dim]
+        H = gate * contact + (1 - gate) * feat_proj          # [B, 21, out_dim]
         
         # 2. 图注意力（建模骨骼结构）
         for gat in self.gat_layers:

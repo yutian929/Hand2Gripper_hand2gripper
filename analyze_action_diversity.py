@@ -110,7 +110,7 @@ def analyze_action_diversity(dataset_dir):
 
 
 if __name__ == "__main__":
-    dataset_path = "/data0/Hand2GripperDatasets/Hand2Gripper_TrainValTest_Dataset"
+    dataset_path = "/data0/Hand2GripperDatasets/Hand2Gripper_Dataset/"
     result = analyze_action_diversity(dataset_path)
 
     print("\n\n========== 最终字典 ==========")
